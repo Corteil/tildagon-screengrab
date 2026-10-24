@@ -15,6 +15,7 @@ License: MIT
 """
 import array
 import binascii
+import math
 import micropython
 import struct
 
@@ -77,9 +78,16 @@ def _new_state():
     return st
 
 
+def _inset(y):
+    """Pixels at each end of row y that fall outside the display's circle."""
+    dy = y + 0.5 - H / 2
+    return max(0, math.ceil(W / 2 - 0.5 - math.sqrt((W / 2) ** 2 - dy * dy)))
+
+
 @micropython.viper
-def _fb_row(src: ptr8, row: int, dst: ptr8):
-    # One row of the big-endian RGB565 framebuffer -> filter byte 0 + RGB888.
+def _fb_row(src: ptr8, row: int, dst: ptr8, inset: int):
+    # One row of the big-endian RGB565 framebuffer -> filter byte 0 + RGB888,
+    # with the first and last `inset` pixels blacked out (the round mask).
     i = row * 480
     dst[0] = 0
     o = 1
@@ -93,6 +101,15 @@ def _fb_row(src: ptr8, row: int, dst: ptr8):
         dst[o + 1] = (g << 2) | (g >> 4)
         dst[o + 2] = (b << 3) | (b >> 2)
         o += 3
+    for x in range(inset):
+        o = 1 + x * 3
+        dst[o] = 0
+        dst[o + 1] = 0
+        dst[o + 2] = 0
+        o = 1 + (239 - x) * 3
+        dst[o] = 0
+        dst[o + 1] = 0
+        dst[o + 2] = 0
 
 
 @micropython.viper
@@ -185,8 +202,9 @@ def _deflate_row(cur: ptr8, prev: ptr8, out: ptr8, st: ptr32):
     st[4] = o
 
 
-def write_png(path, fb):
-    """Write the 240x240 RGB565 (big-endian) framebuffer fb to path as a PNG."""
+def write_png(path, fb, mask=False):
+    """Write the 240x240 RGB565 (big-endian) framebuffer fb to path as a PNG.
+    mask=True blacks out everything outside the display's circle."""
     st = _new_state()
     cur = bytearray(LINE)
     prev = bytearray(LINE)
@@ -198,7 +216,7 @@ def write_png(path, fb):
         f.write(struct.pack(">I", len(ihdr)) + b"IHDR" + ihdr)
         f.write(struct.pack(">I", binascii.crc32(b"IHDR" + ihdr) & 0xFFFFFFFF))
         for y in range(H):
-            _fb_row(fb, y, cur)
+            _fb_row(fb, y, cur, _inset(y) if mask else 0)
             _adler32_update(cur, LINE, adler)
             st[_HAS_PREV] = 1 if y else 0
             _deflate_row(cur, prev, out, st)

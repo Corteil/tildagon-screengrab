@@ -49,6 +49,10 @@ The menu items:
   notifies "Moved N to SD" when done. It does nothing while you're in the
   Storage tile or if **Save to** is `flash`, and backs off for a minute if the
   card is full.
+- **Round mask** (off by default) blacks out the corners outside the round
+  display when a shot is saved, so it is a circle on black rather than a
+  square. It only affects shots saved afterwards. It's exact (a pixel is kept
+  if its centre is inside the 240 px circle) and adds about 1 KB to a file.
 - **Start at boot** switches the `/boot.py` autostart on or off (off by
   default, takes effect next boot).
 - **F key** chooses what F (CANCEL) does: keep Screengrab running in the

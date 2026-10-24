@@ -54,8 +54,9 @@ NTP_RETRY_MS = 300000
 AUTOSTART_KEY = "screengrab_autostart"  # read by the /boot.py snippet, default off
 QUIT_KEY = "screengrab_cancel_quits"  # F/CANCEL quits instead of backgrounding
 AUTOMOVE_KEY = "screengrab_automove"  # move flash shots onto a card as soon as one is mounted
+MASK_KEY = "screengrab_mask"  # black out the corners outside the round display
 CARD_KEY = "screengrab_card"  # where new shots go: "flash", a mount name like "sdcard_1", or unset = auto
-MENU = ("Move flash to SD", "Delete flash shots", "Start at boot", "F key", "Save to", "Auto move")
+MENU = ("Move flash to SD", "Delete flash shots", "Start at boot", "F key", "Save to", "Auto move", "Round mask")
 
 
 def _uuid4():
@@ -130,6 +131,7 @@ class ScreenGrab(app.App):
         self._cancel_quits = settings.get(QUIT_KEY, False)
         self._card_pref = settings.get(CARD_KEY)
         self._automove = settings.get(AUTOMOVE_KEY, False)
+        self._mask = settings.get(MASK_KEY, False)
         self._am_next = 0  # ticks_ms before which auto move stays idle
         self._am_moved = 0
         self._sizes = {}  # (mount path, fs id) -> total bytes, which never change
@@ -255,7 +257,7 @@ class ScreenGrab(app.App):
         # there is: write, and if it runs out, drop the oldest shot and retry.
         while True:
             try:
-                write_png(path, fb)
+                write_png(path, fb, self._mask)
                 return path, external
             except OSError:
                 try:
@@ -376,6 +378,8 @@ class ScreenGrab(app.App):
             return "Save to: " + (self._card_pref or "auto")
         if i == 5:
             return "Auto move: " + ("ON" if self._automove else "OFF")
+        if i == 6:
+            return "Round mask: " + ("ON" if self._mask else "OFF")
         return MENU[i]
 
     def _quit(self):
@@ -395,6 +399,12 @@ class ScreenGrab(app.App):
             settings.set(AUTOSTART_KEY, self._autostart)
             settings.save()
             self.status = "Applies next boot"
+            return
+        if self._sel == 6:
+            self._mask = not self._mask
+            settings.set(MASK_KEY, self._mask)
+            settings.save()
+            self.status = "Corners masked" if self._mask else "Full square"
             return
         if self._sel == 5:
             self._automove = not self._automove
@@ -698,19 +708,19 @@ class ScreenGrab(app.App):
             self.draw_overlays(ctx)
             return
         _chevron(ctx, 96, 1)
-        ctx.font_size = 17
-        ctx.rgb(0.8, 0.85, 1.0).move_to(0, -82).text("Screengrab")
-        ctx.font_size = 12
+        ctx.font_size = 16
+        ctx.rgb(0.8, 0.85, 1.0).move_to(0, -85).text("Screengrab")
+        ctx.font_size = 11
         sd, flash = self._cnt
-        ctx.rgb(0.4, 0.85, 0.5).move_to(0, -63).text(
+        ctx.rgb(0.4, 0.85, 0.5).move_to(0, -68).text(
             "SD: %s   Flash: %d" % ("-" if sd is None else sd, flash)
         )
-        ctx.font_size = 14
+        ctx.font_size = 13
         for i in range(len(MENU)):
-            y = -44 + 18 * i
+            y = -50 + 16 * i
             on, sel = self._enabled(i), i == self._sel
             if sel:
-                ctx.rgb(1.0, 0.55, 0.0).rectangle(-76, y - 8, 152, 16).fill()
+                ctx.rgb(1.0, 0.55, 0.0).rectangle(-76, y - 7, 152, 14).fill()
             if on:
                 ctx.rgb(0.0, 0.0, 0.0) if sel else ctx.rgb(0.9, 0.92, 1.0)
             else:
@@ -718,8 +728,8 @@ class ScreenGrab(app.App):
             ctx.move_to(0, y).text(self._label(i))
         ctx.font_size = 12
         if self.status:
-            ctx.rgb(1.0, 0.8, 0.3).move_to(0, 63).text(self.status[:20])
-        ctx.rgb(0.6, 0.65, 0.8).move_to(0, 81).text("LEFT+RIGHT = grab")
+            ctx.rgb(1.0, 0.8, 0.3).move_to(0, 64).text(self.status[:20])
+        ctx.rgb(0.6, 0.65, 0.8).move_to(0, 82).text("LEFT+RIGHT = grab")
         ctx.restore()
         self.draw_overlays(ctx)
 
