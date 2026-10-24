@@ -54,6 +54,7 @@ def _dist(d):
 
 
 def _new_state():
+    """A fresh per-encode copy of the tables, with the bit writer reset."""
     global _state
     if _state is None:
         _state = array.array("I", bytes(4 * _STATE_SIZE))
@@ -72,7 +73,7 @@ def _new_state():
             _state[_LENGTH + length] = (257 + i) | (_LEXTRA[i] << 12) | ((length - _LBASE[i]) << 16)
         _state[_DIST_LEFT] = _dist(3)
         _state[_DIST_UP] = _dist(LINE)
-    st = _state
+    st = array.array("I", _state)
     st[_BITS], st[_NBITS] = 3, 3  # BFINAL = 1, BTYPE = 01 (fixed Huffman)
     st[_LINE], st[_HAS_PREV], st[_OUT_POS] = LINE, 0, 0
     return st
@@ -202,44 +203,52 @@ def _deflate_row(cur: ptr8, prev: ptr8, out: ptr8, st: ptr32):
     st[4] = o
 
 
-def write_png(path, fb, mask=False):
-    """Write the 240x240 RGB565 (big-endian) framebuffer fb to path as a PNG.
-    mask=True blacks out everything outside the display's circle."""
+def iter_png(fb, mask=False):
+    """Yield the PNG for the 240x240 RGB565 (big-endian) framebuffer fb in
+    pieces, as bytes or memoryviews. A piece is only valid until the next one
+    is asked for, so send or write it first. mask=True blacks out everything
+    outside the display's circle. Being a generator lets a caller (the web
+    server) hand the loop back between pieces."""
     st = _new_state()
     cur = bytearray(LINE)
     prev = bytearray(LINE)
     out = bytearray(OUT_SIZE)
     adler = array.array("I", (1, 0))
+    yield b"\x89PNG\r\n\x1a\n"
+    ihdr = struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0)
+    yield struct.pack(">I", len(ihdr)) + b"IHDR" + ihdr + struct.pack(">I", binascii.crc32(b"IHDR" + ihdr) & 0xFFFFFFFF)
+    for y in range(H):
+        _fb_row(fb, y, cur, _inset(y) if mask else 0)
+        _adler32_update(cur, LINE, adler)
+        st[_HAS_PREV] = 1 if y else 0
+        _deflate_row(cur, prev, out, st)
+        cur, prev = prev, cur
+        last = y == H - 1
+        if last or (y + 1) % ROWS_PER_CHUNK == 0:
+            head = b"\x78\x01" if y < ROWS_PER_CHUNK else b""  # zlib header
+            tail = b""
+            if last:  # end-of-block (seven 0 bits), flush, then the Adler-32
+                bits, nbits = st[_BITS], st[_NBITS] + 7
+                t = bytearray()
+                while nbits > 0:
+                    t.append(bits & 255)
+                    bits >>= 8
+                    nbits -= 8
+                tail = bytes(t) + struct.pack(">I", (adler[1] << 16) | adler[0])
+            body = memoryview(out)[: st[_OUT_POS]]
+            yield struct.pack(">I", len(head) + len(body) + len(tail)) + b"IDAT"
+            crc = binascii.crc32(b"IDAT")
+            for part in (head, body, tail):
+                if len(part):
+                    yield part
+                    crc = binascii.crc32(part, crc)
+            yield struct.pack(">I", crc & 0xFFFFFFFF)
+            st[_OUT_POS] = 0
+    yield struct.pack(">I", 0) + b"IEND" + struct.pack(">I", binascii.crc32(b"IEND") & 0xFFFFFFFF)
+
+
+def write_png(path, fb, mask=False):
+    """Write the framebuffer fb to path as a PNG (see iter_png)."""
     with open(path, "wb") as f:
-        f.write(b"\x89PNG\r\n\x1a\n")
-        ihdr = struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0)
-        f.write(struct.pack(">I", len(ihdr)) + b"IHDR" + ihdr)
-        f.write(struct.pack(">I", binascii.crc32(b"IHDR" + ihdr) & 0xFFFFFFFF))
-        for y in range(H):
-            _fb_row(fb, y, cur, _inset(y) if mask else 0)
-            _adler32_update(cur, LINE, adler)
-            st[_HAS_PREV] = 1 if y else 0
-            _deflate_row(cur, prev, out, st)
-            cur, prev = prev, cur
-            last = y == H - 1
-            if last or (y + 1) % ROWS_PER_CHUNK == 0:
-                head = b"\x78\x01" if y < ROWS_PER_CHUNK else b""  # zlib header
-                tail = b""
-                if last:  # end-of-block (seven 0 bits), flush, then the Adler-32
-                    bits, nbits = st[_BITS], st[_NBITS] + 7
-                    t = bytearray()
-                    while nbits > 0:
-                        t.append(bits & 255)
-                        bits >>= 8
-                        nbits -= 8
-                    tail = bytes(t) + struct.pack(">I", (adler[1] << 16) | adler[0])
-                body = memoryview(out)[: st[_OUT_POS]]
-                f.write(struct.pack(">I", len(head) + len(body) + len(tail)) + b"IDAT")
-                crc = binascii.crc32(b"IDAT")
-                for part in (head, body, tail):
-                    if len(part):
-                        f.write(part)
-                        crc = binascii.crc32(part, crc)
-                f.write(struct.pack(">I", crc & 0xFFFFFFFF))
-                st[_OUT_POS] = 0
-        f.write(struct.pack(">I", 0) + b"IEND" + struct.pack(">I", binascii.crc32(b"IEND") & 0xFFFFFFFF))
+        for part in iter_png(fb, mask):
+            f.write(part)

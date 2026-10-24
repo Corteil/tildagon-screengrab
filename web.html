@@ -1,0 +1,163 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Screengrab</title>
+<style>
+:root{--bg:#0d1020;--card:#171b30;--fg:#e4e8ff;--dim:#8d94b8;--acc:#ff8c00;--ok:#00d84c;--bad:#ff5050}
+*{box-sizing:border-box}
+body{margin:0;font:15px system-ui,sans-serif;background:var(--bg);color:var(--fg)}
+header{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;padding:10px 14px;background:var(--card);position:sticky;top:0;z-index:2}
+h1{font-size:18px;margin:0}
+#sum{color:var(--dim);font-size:13px;flex:1}
+nav{display:flex;gap:6px;padding:10px 14px 0}
+button,select,input{font:inherit;color:var(--fg);background:#232845;border:1px solid #333a62;border-radius:6px;padding:6px 12px}
+button{cursor:pointer}button:hover{border-color:var(--acc)}
+button.on,nav button.sel{background:var(--acc);color:#000;border-color:var(--acc)}
+button.bad{color:var(--bad)}
+main{padding:14px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:12px}
+.card{background:var(--card);border-radius:10px;overflow:hidden}
+.card img{width:100%;aspect-ratio:1;display:block;background:#000;object-fit:contain}
+.card div{padding:6px 8px;font-size:12px;color:var(--dim)}
+.card .acts{display:flex;flex-wrap:wrap;gap:4px;padding:0 8px 8px}.card .acts button{padding:3px 8px;font-size:12px}
+.row{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:0 0 14px}
+#live{width:min(92vw,480px);aspect-ratio:1;background:#000;border-radius:10px;display:block}
+.msg{color:var(--acc);min-height:1.4em}
+.hidden{display:none}
+</style>
+<header>
+  <h1>Screengrab</h1><span id="sum">connecting…</span>
+</header>
+<nav id="tabs">
+  <button data-t="gallery" class="sel">Gallery</button>
+  <button data-t="live">Live</button>
+  <button data-t="control">Control</button>
+</nav>
+<main>
+  <p class="msg" id="msg"></p>
+
+  <section id="gallery">
+    <div class="row">
+      <select id="store"></select>
+      <button id="refresh">Refresh</button>
+      <span id="count" style="color:var(--dim)"></span>
+    </div>
+    <div class="grid" id="grid"></div>
+    <p><button id="more" class="hidden">Load more</button></p>
+  </section>
+
+  <section id="live-tab" class="hidden">
+    <div class="row">
+      <button id="pause">Pause</button>
+      <label><input type="checkbox" id="lmask"> round mask</label>
+      <button id="snap">Save this screen</button>
+      <span id="fps" style="color:var(--dim)"></span>
+    </div>
+    <img id="live" alt="badge screen">
+  </section>
+
+  <section id="control" class="hidden">
+    <div class="row">
+      <button id="cap">Capture now</button>
+      <label>after <select id="cdelay"></select></label>
+      <button id="capd">Capture after delay</button>
+    </div>
+    <div class="row">
+      <button id="tl">Timelapse</button>
+      <label>every <input id="tlint" type="number" min="1" max="3600" style="width:6em"> s</label>
+      <span id="tlinfo" style="color:var(--dim)"></span>
+    </div>
+    <div class="row">
+      <label>Badge name <input id="bname" maxlength="24" size="14" autocapitalize="off" spellcheck="false">.local</label>
+      <button id="savename">Save name</button>
+      <span id="nameinfo" style="color:var(--dim)"></span>
+    </div>
+    <div class="row">
+      <label>Save new shots to <select id="saveto"></select></label>
+      <label><input type="checkbox" id="mask"> round mask on saved shots</label>
+    </div>
+  </section>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+const H={'X-Requested-With':'screengrab','Content-Type':'application/json'};
+let st=null,tab='gallery',offset=0,paused=false,liveBusy=false;
+const say=(t,bad)=>{$('msg').textContent=t||'';$('msg').style.color=bad?'var(--bad)':'var(--acc)'};
+async function api(path,body){
+  const r=await fetch(path,body===undefined?{}:{method:'POST',headers:H,body:JSON.stringify(body)});
+  if(r.status===401){location.reload();throw new Error('PIN needed')}
+  if(!r.ok)throw new Error((await r.text())||r.status);
+  return r.json();
+}
+const fmtB=n=>n==null?'?':n>=2**30?(n/2**30).toFixed(1)+' GB':n>=2**20?(n>>20)+' MB':(n>>10)+' KB';
+function pretty(n){
+  const m=/^shot_(\d+)_(\d{4})(\d\d)(\d\d)-(\d\d)(\d\d)(\d\d)\.png$/.exec(n);
+  if(m)return`#${+m[1]} · ${m[2]}-${m[3]}-${m[4]} ${m[5]}:${m[6]}:${m[7]} UTC`;
+  const u=/^shot_(\d+)_/.exec(n);return u?`#${+u[1]} · no clock`:n;
+}
+async function status(){
+  try{st=await api('/api/status')}catch(e){$('sum').textContent='offline';return}
+  const s=st.storages.map(x=>`${x.name}: ${x.count} shots, ${fmtB(x.free)} free`).join(' · ');
+  $('sum').textContent=`saving to ${st.target} · ${s}`+(st.timelapse.on?` · ⏺ timelapse ${st.timelapse.count}`:'')+(st.clock?'':' · clock not set');
+  const sel=$('store'),cur=sel.value;
+  sel.innerHTML=st.storages.map(x=>`<option>${x.name}</option>`).join('');sel.value=cur||st.target;
+  const so=$('saveto');
+  if(document.activeElement!==so){so.innerHTML='<option value="">auto</option>'+st.storages.map(x=>`<option>${x.name}</option>`).join('');so.value=st.save_to||''}
+  $('cdelay').innerHTML=st.delays.filter(d=>d).map(d=>`<option>${d}</option>`).join('');
+  if(document.activeElement!==$('tlint'))$('tlint').value=st.interval;
+  $('mask').checked=st.mask;
+  if(document.activeElement!==$('bname'))$('bname').value=st.name;
+  $('nameinfo').textContent=st.name_live?`${st.name}.local works on this Wi-Fi`:`${st.name}.local works after the badge restarts`;
+  $('tl').textContent=st.timelapse.on?'Stop timelapse':'Start timelapse';$('tl').className=st.timelapse.on?'on':'';
+  $('tlinfo').textContent=st.timelapse.on?`${st.timelapse.count} shots so far`:'';
+}
+// Thumbnails: two at a time, so the badge always has a free connection for the page itself.
+const q=[];let running=0;
+function pump(){while(running<2&&q.length){const[img,src]=q.shift();running++;
+  img.onload=img.onerror=()=>{running--;pump()};img.src=src}}
+function card(storage,s){
+  const d=document.createElement('div');d.className='card';
+  const a=`/shot/${storage}/${s.n}`,img=document.createElement('img');q.push([img,a]);
+  d.append(img);
+  const t=document.createElement('div');t.textContent=pretty(s.n)+' · '+fmtB(s.s);d.append(t);
+  const acts=document.createElement('div');acts.className='acts';
+  const mk=(txt,fn,cls)=>{const b=document.createElement('button');b.textContent=txt;b.className=cls||'';b.onclick=fn;acts.append(b)};
+  mk('Open',()=>window.open(a));
+  mk('Download',()=>location.href=a+'?dl=1');
+  for(const o of st.storages)if(o.name!==storage)mk('→ '+o.name,async()=>{
+    try{await api('/api/move',{storage,name:s.n,to:o.name});d.remove();say('Moved to '+o.name);status()}catch(e){say(e.message,1)}});
+  mk('Delete',async()=>{if(!confirm('Delete '+s.n+'?'))return;
+    try{await api('/api/delete',{storage,name:s.n});d.remove();status()}catch(e){say(e.message,1)}},'bad');
+  d.append(acts);return d;
+}
+async function load(reset){
+  if(!st)await status();
+  const storage=$('store').value;if(reset){offset=0;$('grid').innerHTML='';q.length=0}
+  let r;try{r=await api(`/api/shots?storage=${storage}&offset=${offset}&limit=24`)}catch(e){say(e.message,1);return}
+  for(const s of r.shots)$('grid').append(card(storage,s));pump();
+  offset+=r.shots.length;$('count').textContent=`${Math.min(offset,r.total)} of ${r.total}`;
+  $('more').className=offset<r.total?'':'hidden';
+}
+async function live(){
+  if(tab!=='live'||paused||liveBusy)return;liveBusy=true;const t=performance.now();
+  const img=$('live');
+  img.onload=()=>{liveBusy=false;$('fps').textContent=(1000/(performance.now()-t)).toFixed(1)+' fps';live()};
+  img.onerror=()=>{liveBusy=false;setTimeout(live,1000)};
+  img.src='/api/frame?mask='+($('lmask').checked?1:0)+'&t='+Date.now();
+}
+function show(t){
+  tab=t;history.replaceState(null,'','#'+t);for(const b of document.querySelectorAll('#tabs button'))b.className=b.dataset.t===t?'sel':'';
+  $('gallery').className=t==='gallery'?'':'hidden';$('live-tab').className=t==='live'?'':'hidden';$('control').className=t==='control'?'':'hidden';
+  if(t==='live')live();if(t==='gallery')load(true);
+}
+for(const b of document.querySelectorAll('#tabs button'))b.onclick=()=>show(b.dataset.t);
+$('refresh').onclick=()=>{status();load(true)};$('store').onchange=()=>load(true);$('more').onclick=()=>load(false);
+$('pause').onclick=()=>{paused=!paused;$('pause').textContent=paused?'Resume':'Pause';$('pause').className=paused?'on':'';live()};
+const snap=async d=>{try{await api('/api/capture',d===undefined?{delay:0}:{delay:d});say(d?`Capturing in ${d} s…`:'Captured');setTimeout(status,1500)}catch(e){say(e.message,1)}};
+$('snap').onclick=()=>snap();$('cap').onclick=()=>snap();$('capd').onclick=()=>snap(+$('cdelay').value);
+$('tl').onclick=async()=>{try{await api('/api/timelapse',{on:!st.timelapse.on,interval:+$('tlint').value});say('');status()}catch(e){say(e.message,1)}};
+$('saveto').onchange=async()=>{try{await api('/api/options',{save_to:$('saveto').value||null});status()}catch(e){say(e.message,1)}};
+$('savename').onclick=async()=>{try{await api('/api/options',{name:$('bname').value.trim().toLowerCase()});say('Name saved');status()}catch(e){say(e.message,1)}};
+$('mask').onchange=async()=>{try{await api('/api/options',{mask:$('mask').checked});status()}catch(e){say(e.message,1)}};
+const t0=location.hash.slice(1);if(t0==='live'||t0==='control')status().then(()=>show(t0));else status().then(()=>load(true));setInterval(()=>{if(!document.hidden)status()},8000);
+</script>

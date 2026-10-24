@@ -35,8 +35,12 @@ import display
 import settings
 import vfs
 
+from app_components.dialog import TextDialog
+
 from events.input import Buttons, BUTTON_TYPES, ButtonDownEvent, ButtonUpEvent
+from events.keyboard import KEYBOARD_BUTTONS
 from system.eventbus import eventbus
+from system.scheduler.events import RequestForegroundPushEvent
 from system.notification.events import ShowNotificationEvent
 
 from .pngenc import write_png
@@ -62,9 +66,23 @@ DELAYS = (0, 1, 2, 3, 5, 10, 15, 20, 30, 60)
 INTERVALS = (1, 2, 3, 5, 10, 15, 20, 30, 45, 60, 120, 300, 600, 1800, 3600)
 NOTIFY_DELAY_S = 5  # a "grab in N s" banner lasts ~3 s, so only show it if it will be gone
 
+WEB_PIN_KEY = "screengrab_web_pin"  # ask for a PIN, default on
+WEB_NET_KEY = "screengrab_web_net"  # "wifi" (join the usual network) or "hotspot" (the badge makes its own)
+WEB_IDLE_KEY = "screengrab_web_idle"  # minutes without a request before it switches itself off; 0 = never
+WEB_AP_KEY = "screengrab_web_appass"  # the hotspot password, made once so phones can remember it
+NAME_KEY = "screengrab_web_name"  # the badge's network name: <name>.local on your Wi-Fi
+DEFAULT_NAME = "tildagon"
+NAME_ALLOWED = "abcdefghijklmnopqrstuvwxyz0123456789-"
+NAME_MAX = 24
+WEB_WORDS_KEY = "screengrab_web_words"  # make that password from four short words instead of 8 characters
+WEB_IDLES = (0, 1, 5, 10, 30, 60)
+SHOT_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-."
+FREE_REFRESH_MS = {"flash": 120000}  # statvfs on the badge flash takes ~700 ms; cards are instant
+
 MENU = ("Move flash to SD", "Delete flash shots")
 SETTINGS = ("Start at boot", "F key", "Save to", "Auto move")
 CAPTURE = ("Delay", "Interval", "Round mask", "Timelapse")
+WEBROWS = ("Server", "PIN", "Network", "AP pass", "Idle off", "Name")
 
 ICON_GREEN = (0.0, 0.85, 0.3)
 ICON_AMBER = (1.0, 0.75, 0.2)
@@ -84,6 +102,30 @@ def _stamp():
     if t[0] >= CLOCK_OK_YEAR:
         return "%04d%02d%02d-%02d%02d%02d" % t[:6]
     return _uuid4()  # no clock: a unique reference instead (the UUID of urn:uuid:...)
+
+
+def valid_name(name):
+    """A hostname: lowercase letters, digits and hyphens, not starting or ending with one."""
+    return (isinstance(name, str) and 1 <= len(name) <= NAME_MAX and not name.startswith("-") and not name.endswith("-")
+            and all(c in NAME_ALLOWED for c in name))
+
+
+try:
+    import network
+
+    # The name the badge came up with. The firmware's mDNS responder takes it once, when Wi-Fi first
+    # connects, so a name changed later only becomes <name>.local after the next restart.
+    _BOOT_NAME = network.hostname()
+except Exception:  # pragma: no cover
+    _BOOT_NAME = None
+
+
+def _wifi_qr(ssid, password):
+    """The text a phone's camera understands as "join this Wi-Fi network"."""
+    def esc(s):
+        return "".join("\\" + c if c in '\\;,":' else c for c in s)
+
+    return "WIFI:T:WPA;S:%s;P:%s;;" % (esc(ssid), esc(password))
 
 
 def _fmt_bytes(n):
@@ -190,6 +232,22 @@ class ScreenGrab(app.App):
         self._am_next = 0  # ticks_ms before which auto move stays idle
         self._am_moved = 0
         self._failed = False  # the last save failed (drives the icon)
+        self._web = None  # the WebServer while it's on (never started at boot)
+        self._web_pin_on = settings.get(WEB_PIN_KEY, True)
+        self._web_net = settings.get(WEB_NET_KEY, "wifi")
+        self._web_idle = settings.get(WEB_IDLE_KEY, 10)
+        self._web_words = settings.get(WEB_WORDS_KEY, False)
+        name = settings.get(NAME_KEY, DEFAULT_NAME)
+        self._name = name if valid_name(name) else DEFAULT_NAME
+        self._tdlg = None  # the firmware's TextDialog while the name is being typed
+        self._wview = 0  # 0 the option rows, 1 the connection card, 2 the join QR, 3 the sign-in QR
+        self._qr = None  # (text, size, modules) of the last QR drawn, so a redraw is free
+        self._qr_signins = 0  # the server's sign-in count when the showing code was made
+        self._web_pin = None
+        self._web_ap = None  # (ssid, password) while the hotspot is up
+        self._web_err = ""
+        self._free_cache = {}
+        self._last_sig = None  # of the last frame drawn, so an unchanged screen isn't redrawn
         self._delay_s = settings.get(DELAY_KEY, 0)
         self._interval_s = settings.get(INTERVAL_KEY, 10)
         self._timer_at = None  # ticks_ms when a delayed grab fires
@@ -200,6 +258,7 @@ class ScreenGrab(app.App):
         self._editing = False  # UP/DOWN change the highlighted number on the capture tile
         self._sset = 0  # highlighted row on the settings tile
         self._cset = 0  # highlighted row on the capture tile
+        self._wset = 0  # highlighted row on the web tile
         self._nav_dir = None  # "L"/"R": the first of LEFT/RIGHT held on the main screen
         self._nav_spoiled = False  # both were held: that's the grab combo, not navigation
         self._sizes = {}  # (mount path, fs id) -> total bytes, which never change
@@ -219,6 +278,7 @@ class ScreenGrab(app.App):
         self._vdrawn = False
         self._ui_ms = 0  # how much longer the viewer overlay stays up
         self._ntp_next = time.ticks_add(time.ticks_ms(), 30000)
+        eventbus.on_async(RequestForegroundPushEvent, self._on_foreground, self)
         if ScreenGrab._primary is None:
             ScreenGrab._primary = self
             eventbus.on(ButtonDownEvent, self._down, self._sink)
@@ -233,16 +293,22 @@ class ScreenGrab(app.App):
                     self._held.add(name)
             if self._armed and len(self._held) == len(COMBO):
                 self._armed = False
-                if self._delay_s:
-                    self._timer_at = time.ticks_add(time.ticks_ms(), self._delay_s * 1000)
-                    if self._delay_s >= NOTIFY_DELAY_S:
-                        eventbus.emit(ShowNotificationEvent(message="Grab in %d s" % self._delay_s))
-                else:
-                    # Grab now, before any notification is drawn; write later.
-                    self._pending = display.get_framebuffer()
-                    self._pending_silent = False
+                self.trigger_capture()
         except Exception as e:
             print("Screengrab:", e)
+
+    def trigger_capture(self, delay=None):
+        """Take a screenshot, after the Delay setting unless a delay in seconds
+        is given. This is the LEFT+RIGHT grab, and what the web page calls."""
+        wait = self._delay_s if delay is None else delay
+        if wait:
+            self._timer_at = time.ticks_add(time.ticks_ms(), wait * 1000)
+            if wait >= NOTIFY_DELAY_S:
+                eventbus.emit(ShowNotificationEvent(message="Grab in %d s" % wait))
+        else:
+            # Grab now, before any notification is drawn; write later.
+            self._pending = display.get_framebuffer()
+            self._pending_silent = False
 
     def _up(self, event):
         for name in COMBO:
@@ -374,6 +440,190 @@ class ScreenGrab(app.App):
         self._queue.pop(0)
         self._moved += 1
 
+    # --- web server ---------------------------------------------------------
+
+    def web_start(self):
+        """Switch the web server on. Returns "" or why it couldn't start."""
+        if self._web:
+            return ""
+        try:
+            import wifi
+            from .webserver import WebServer
+
+            if self._web_net == "hotspot":
+                pw = settings.get(WEB_AP_KEY) or self._new_ap_password()
+                import binascii
+                import network
+
+                ssid = "Tildagon-" + binascii.hexlify(network.WLAN(network.STA_IF).config("mac")[-2:]).decode()
+                wifi.accesspoint_start(ssid, pw)
+                self._web_ap = (ssid, pw)
+                ip = wifi.accesspoint_get_ip()  # the hotspot's DHCP offers this as the DNS server too, so phones ask the badge
+                network.WLAN(network.AP_IF).ifconfig((ip, "255.255.255.0", ip, ip))
+            elif not wifi.status():
+                self._web_err = "No Wi-Fi"
+                return self._web_err
+            self._web_pin = "%06d" % (int.from_bytes(os.urandom(4), "big") % 1000000) if self._web_pin_on else None
+            gc.collect()
+            self.apply_name()
+            host = wifi.accesspoint_get_ip() if self._web_ap else wifi.get_ip()
+            self._web = WebServer(self, self._web_pin, self._web_idle * 60, host=host, captive=self._web_ap is not None)
+            self._web.start()
+            self._web_err = ""
+            self._wview = 1  # show the big connection card
+        except Exception as e:
+            self._web_err = str(e)[:40] or "error"
+            self.web_stop()
+            return self._web_err
+        return ""
+
+    def _new_ap_password(self):
+        """Make and keep a hotspot password in the chosen style (kept, so a phone can remember it)."""
+        from .webserver import passphrase, password
+
+        pw = passphrase(4) if self._web_words else password(8)
+        settings.set(WEB_AP_KEY, pw)
+        settings.save()
+        return pw
+
+    def apply_name(self):
+        """Use the saved name as the hostname. The router sees it at the next connection."""
+        try:
+            import network
+
+            network.hostname(self._name)
+        except Exception as e:
+            print("Screengrab: hostname:", e)
+
+    def name_live(self):
+        """Is <name>.local answering already, or only after a restart?"""
+        return _BOOT_NAME == self._name
+
+    def web_stop(self):
+        if self._web:
+            self._web.stop()
+            self._web = None
+        if self._web_ap:
+            try:
+                import wifi
+
+                wifi.accesspoint_stop()
+            except Exception:
+                pass
+            self._web_ap = None
+        gc.collect()
+
+    def web_idle_off(self):
+        self._wview = 0
+        self.web_stop()
+        eventbus.emit(ShowNotificationEvent(message="Web server off (idle)"))
+
+    def web_url(self):
+        if not self._web:
+            return ""
+        import wifi
+
+        ip = wifi.accesspoint_get_ip() if self._web_ap else wifi.get_ip()
+        return "http://%s%s" % (ip, "" if self._web.port == 80 else ":%d" % self._web.port)
+
+    def _free_cached(self, name):
+        now = time.ticks_ms()
+        ent = self._free_cache.get(name)
+        if ent is None or time.ticks_diff(now, ent[0]) > FREE_REFRESH_MS.get(name, 5000):
+            try:
+                ent = (now, self._free("/" if name == "flash" else "/" + name))
+            except OSError:
+                ent = (now, None)
+            self._free_cache[name] = ent
+        return ent[1]
+
+    def web_status(self, collect=False):
+        if collect:
+            gc.collect()  # so the heap figure is what's really free, not what's awaiting a sweep
+        cards = self._cards()
+        return {
+            "target": self._target_name(cards),
+            "storages": [
+                {"name": n, "count": len(self._shots(d)), "free": self._free_cached(n)}
+                for n, d in self._storages()
+            ],
+            "timelapse": {"on": self._tl_on, "count": self._tl_count},
+            "delay": self._delay_s,
+            "interval": self._interval_s,
+            "mask": self._mask,
+            "save_to": self._card_pref,
+            "delays": DELAYS,
+            "failed": self._failed,
+            "taken": self.count,
+            "requests": self._web.requests if self._web else 0,
+            "name": self._name,
+            "name_live": self.name_live(),
+            "clock": time.localtime()[0] >= CLOCK_OK_YEAR,
+            "heap": gc.mem_free(),
+            "uptime": time.ticks_ms() // 1000,
+        }
+
+    def _storage_dir(self, storage):
+        for n, d in self._storages():
+            if n == storage:
+                return d
+        return None
+
+    def web_shot_path(self, storage, name):
+        """The real path of a shot, or None. The only way the web server turns
+        a name from a request into a file, so it checks both parts."""
+        d = self._storage_dir(storage)
+        if not d or not (name and name.startswith("shot_") and name.endswith(".png") and len(name) <= 80):
+            return None
+        if any(ch not in SHOT_CHARS for ch in name) or ".." in name:
+            return None
+        path = d + "/" + name
+        return path if _exists(path) else None
+
+    def web_shots(self, storage, offset=0, limit=60):
+        storage = storage or self._target_name(self._cards())
+        d = self._storage_dir(storage)
+        if d is None:
+            return {"storage": storage, "total": 0, "offset": 0, "shots": []}
+        names = self._shots(d)[::-1]  # newest first
+        offset, limit = max(0, offset), max(1, min(100, limit))
+        return {
+            "storage": storage,
+            "total": len(names),
+            "offset": offset,
+            "shots": [{"n": n, "s": os.stat(d + "/" + n)[6]} for n in names[offset:offset + limit]],
+        }
+
+    def _forget_file(self, d, name):
+        """Keep the Storage tile's list straight when a shot goes away behind it."""
+        self._cnt_ms = 0
+        if self._face == 1 and self._lvl >= 1 and self._stor and self._stor[self._ssel][1] == d and name in self._files:
+            self._files.remove(name)
+            self._fsel = min(self._fsel, max(0, len(self._files) - 1))
+            if not self._files:
+                self._lvl = 1
+
+    def web_delete(self, storage, name):
+        path = self.web_shot_path(storage, name)
+        if not path:
+            return "no such shot"
+        os.remove(path)
+        self._forget_file(self._storage_dir(storage), name)
+        return ""
+
+    def web_move(self, storage, name, to):
+        if not self.web_shot_path(storage, name):
+            return "no such shot"
+        dst = self._storage_dir(to)
+        if not dst or to == storage:
+            return "pick a different, existing storage"
+        try:
+            self._move_file(self._storage_dir(storage), name, dst)
+        except OSError as e:
+            return str(e)
+        self._forget_file(self._storage_dir(storage), name)
+        return ""
+
     # --- background -------------------------------------------------------
 
     def _sync_clock(self):
@@ -492,6 +742,168 @@ class ScreenGrab(app.App):
             value = "< %s >" % value
         return ("Delay: " if i == 0 else "Interval: ") + value
 
+    def _wlabel(self, i):
+        if i == 0:
+            return "Server: " + ("ON" if self._web else "OFF")
+        if i == 1:
+            return "PIN: " + ("ON" if self._web_pin_on else "OFF")
+        if i == 2:
+            return "Network: " + ("Hotspot" if self._web_net == "hotspot" else "Wi-Fi")
+        if i == 3:
+            return "AP pass: " + ("4 words" if self._web_words else "8 chars")
+        if i == 5:
+            return "Name: " + self._name
+        value = "never" if not self._web_idle else "%d min" % self._web_idle
+        if self._editing and i == self._wset:
+            value = "< %s >" % value
+        return "Idle off: " + value
+
+    def _qr_code(self):
+        """Make a new one-time sign-in code, if signing in needs one."""
+        web = self._web
+        if web and web.pin:
+            web.new_qr_token()
+            self._qr_signins = web.signins
+
+    def _wrestart(self):
+        """Apply a changed web option to a server that is already running."""
+        if self._web:
+            self.web_stop()
+            self.status = self.web_start() or "Restarted"
+
+    def _wtoggle(self, i):
+        """Act on row i of the web tile."""
+        if i == 0:
+            if self._web:
+                self.web_stop()
+                self.status = "Web server off"
+            else:
+                self.status = self.web_start() or "Web server on"
+        elif i == 1:
+            self._web_pin_on = not self._web_pin_on
+            settings.set(WEB_PIN_KEY, self._web_pin_on)
+            settings.save()
+            self._wrestart()
+            self.status = "PIN required" if self._web_pin_on else "Open: no PIN!"
+        elif i == 2:
+            self._web_net = "wifi" if self._web_net == "hotspot" else "hotspot"
+            settings.set(WEB_NET_KEY, self._web_net)
+            settings.save()
+            self._wrestart()
+            self.status = "Badge Wi-Fi hotspot" if self._web_net == "hotspot" else "Your Wi-Fi"
+        elif i == 3:
+            self._web_words = not self._web_words
+            settings.set(WEB_WORDS_KEY, self._web_words)
+            self._new_ap_password()  # a new style means a new password; phones must rejoin
+            self._wrestart()
+            self.status = "New: 4 short words" if self._web_words else "New: 8 characters"
+        elif i == 5:
+            self._name_dialog()
+        else:
+            self._editing = True
+            self.status = "UP/DOWN to change"
+
+    def _name_dialog(self):
+        """Ask for the name with the firmware's own text entry: the badge's buttons pick
+        letters, and a USB keyboard types straight into it."""
+        dlg = TextDialog("Badge name", self, on_complete=self._name_done, on_cancel=self._name_cancel)
+        dlg.text = self._name
+        self._tdlg = dlg
+        self.overlays.append(dlg)
+        eventbus.on(ButtonDownEvent, self._name_extra_keys, self)
+
+    def _name_close(self):
+        if self._tdlg is not None:
+            if self._tdlg in self.overlays:
+                self.overlays.remove(self._tdlg)
+            eventbus.remove(ButtonDownEvent, self._name_extra_keys, self)
+            self._tdlg = None
+        self.button_states.clear()
+
+    def _name_extra_keys(self, event):
+        """Enter and Escape on a USB keyboard: the firmware dialog doesn't act on those."""
+        dlg = self._tdlg
+        if dlg is None or dlg._result is not None:
+            return
+        if KEYBOARD_BUTTONS["ENTER"] in event.button and event.button.find_parent_in_group("Keyboard"):
+            dlg._cleanup()
+            dlg._result = dlg.text
+            self._name_done()
+        elif KEYBOARD_BUTTONS["ESCAPE"] in event.button and event.button.find_parent_in_group("Keyboard"):
+            dlg._cleanup()
+            dlg._result = False
+            self._name_cancel()
+
+    def _name_done(self):
+        text = (self._tdlg.text if self._tdlg else "").strip().lower()
+        self._name_close()
+        if not valid_name(text):
+            self.status = "Use a-z 0-9 - (24 max)"
+            return
+        self._name = text
+        settings.set(NAME_KEY, text)
+        settings.save()
+        self.apply_name()
+        self.status = "Saved" if self.name_live() else "Saved: restart for .local"
+
+    def _name_cancel(self):
+        self._name_close()
+        self.status = "Name unchanged"
+
+    def _wnudge(self, step):
+        i = min(range(len(WEB_IDLES)), key=lambda k: abs(WEB_IDLES[k] - self._web_idle))
+        self._web_idle = WEB_IDLES[max(0, min(len(WEB_IDLES) - 1, i + step))]
+        settings.set(WEB_IDLE_KEY, self._web_idle)
+        if self._web:
+            self._web.idle_s = self._web_idle * 60
+            self._web.last_active = time.ticks_ms()
+        self.status = "Switches off after %d min" % self._web_idle if self._web_idle else "Stays on"
+
+    def _update_web(self, b, tap):
+        step = b.pressed(BUTTON_TYPES["DOWN"]) - b.pressed(BUTTON_TYPES["UP"])
+        confirm = b.pressed(BUTTON_TYPES["CONFIRM"])
+        if self._wview and not self._web:
+            self._wview = 0
+        if self._wview:  # the connection card and its QR pages
+            if step > 0:
+                self._wview = 0
+                return
+            if step < 0:  # back a page
+                self._wview = 1 if self._wview == 3 and not self._web_ap else max(1, self._wview - 1)
+                return
+            if confirm:
+                if self._wview == 1:
+                    self._wview = 2 if self._web_ap else 3
+                elif self._wview == 2:
+                    self._wview = 3
+                if self._wview == 3:
+                    self._qr_code()  # a fresh one-time code each time the sign-in page is opened or asked for
+                return
+        elif self._editing:
+            if step:
+                self._wnudge(-step)
+            if tap == "R" or confirm:
+                self._editing = False
+                settings.save()
+                self.status = ""
+            return
+        if tap == "R":
+            self._back()
+            return
+        if tap == "L":
+            self._face, self.status = 2, ""
+            return
+        if self._wview:
+            return
+        if step < 0 and self._wset == 0 and self._web:  # UP from the top row goes back to the card
+            self._wview = 1
+            return
+        if step:
+            self._wset = (self._wset + step) % len(WEBROWS)
+            self.status = ""
+        if confirm:
+            self._wtoggle(self._wset)
+
     def _toggle(self, i):
         """Change setting i on the settings tile."""
         if i == 0:
@@ -527,15 +939,61 @@ class ScreenGrab(app.App):
             settings.set(MASK_KEY, self._mask)
             settings.save()
             self.status = "Corners masked" if self._mask else "Full square"
-        elif self._tl_on:
-            self._stop_timelapse()
+        else:
+            self.set_timelapse(not self._tl_on)
+
+    def set_timelapse(self, on):
+        """Start or stop the time-lapse. Returns "" or why it didn't start."""
+        if not on:
+            if self._tl_on:
+                self._stop_timelapse()
             self.status = "Timelapse stopped"
+        elif self._tl_on:
+            pass
         elif self._target_name(self._cards()) == "flash":
             self.status = "Needs an SD card"
+            return self.status
         else:
             self._tl_on, self._tl_count = True, 0
             self._tl_next = time.ticks_add(time.ticks_ms(), self._interval_s * 1000)
             self.status = "First shot in %d s" % self._interval_s
+        return ""
+
+    def set_option(self, name, value):
+        """Change a capture option from outside the tiles (the web page).
+        Returns "" or what was wrong with the value."""
+        if name == "delay":
+            if not isinstance(value, int) or value not in DELAYS:
+                return "delay must be one of %s" % (DELAYS,)
+            self._delay_s = value
+            settings.set(DELAY_KEY, value)
+        elif name == "interval":
+            if not isinstance(value, int) or not 1 <= value <= 3600:
+                return "interval must be 1-3600 s"
+            self._interval_s = value
+            settings.set(INTERVAL_KEY, value)
+        elif name == "mask":
+            if not isinstance(value, bool):
+                return "mask must be true or false"
+            self._mask = value
+            settings.set(MASK_KEY, value)
+        elif name == "name":
+            if not valid_name(value):
+                return "name: 1-24 lowercase letters, digits or hyphens, not starting or ending with a hyphen"
+            self._name = value
+            settings.set(NAME_KEY, value)
+            self.apply_name()
+        elif name == "save_to":
+            cards = self._cards()
+            if value not in [None, "flash"] + cards:
+                return "save_to must be null, flash or a card"
+            self._card_pref = value
+            settings.set(CARD_KEY, value)
+            self._tname = self._target_name(cards)
+        else:
+            return "unknown option"
+        settings.save()
+        return ""
 
     def _nudge(self, step):
         """Move the number being edited one rung up or down its ladder."""
@@ -581,7 +1039,7 @@ class ScreenGrab(app.App):
             self._back()
             return
         if tap == "L":
-            self._face, self.status = 2, ""
+            self._face, self.status = 4, ""
             return
         if step:
             self._cset = (self._cset + step) % len(CAPTURE)
@@ -591,6 +1049,8 @@ class ScreenGrab(app.App):
 
     def _quit(self):
         """Stop listening for the combo and close the app."""
+        self._name_close()
+        self.web_stop()
         main = ScreenGrab._primary
         ScreenGrab._primary = None
         if main is not None:
@@ -659,9 +1119,16 @@ class ScreenGrab(app.App):
         if self._face == 3 and self._editing:
             self._finish_edit()
             return
+        if self._face == 4 and self._editing:
+            self._editing = False
+            settings.save()
+            self.status = ""
+            return
         self.status = ""
         self._fconfirm = False
-        if self._face == 2:  # settings -> capture
+        if self._face == 2:  # settings -> web
+            self._face = 4
+        elif self._face == 4:  # web -> capture
             self._face = 3
         elif self._face == 1 and self._lvl == 2:
             self._lvl = 1
@@ -772,8 +1239,39 @@ class ScreenGrab(app.App):
         self._nav_dir, self._nav_spoiled = None, False
         return None if spoiled or direction not in ("L", "R") else direction
 
+    async def _on_foreground(self, _):
+        """Back in front: the screen holds another app's last frame, so draw again."""
+        self._last_sig = None
+
+    def _sig(self):
+        """What the current screen depends on: if this hasn't changed, there is
+        nothing to redraw, and a redraw costs the whole badge ~90 ms."""
+        web = self._web
+        return (
+            self._face, self._lvl, self._sel, self._ssel, self._sset, self._cset, self._wset, self._wview, self._web_words, self._fsel,
+            self.status, self._cnt, self._tname, self._tl_on, self._tl_count, self._failed, self._editing,
+            self._ui_ms > 0, web is not None, web and (web.idle_left(), web.requests),
+            self._web_err, web and (web.qr_valid(), web.signins), self._name, self._delay_s, self._interval_s, self._mask, self._autostart, self._cancel_quits,
+            self._card_pref, self._automove, self._web_pin_on, self._web_net, self._web_idle, bool(self._queue),
+            len(self._files), self._stor and self._stor[self._ssel][2:] or None,
+        )
+
     def update(self, delta):
+        if self._tdlg is not None:
+            self._update(delta)
+            return  # redraw every frame while the dialog is open
+        if self._update(delta) is False:
+            return False
+        sig = self._sig()
+        if sig == self._last_sig:
+            return False
+        self._last_sig = sig
+
+    def _update(self, delta):
         b = self.button_states
+        if self._tdlg is not None:  # the text dialog is handling every key; keep out of its way (and keep redrawing it)
+            b.clear()
+            return
         tap = self._lr_tap(b)
         if b.get(BUTTON_TYPES["CANCEL"]):
             b.clear()
@@ -791,6 +1289,8 @@ class ScreenGrab(app.App):
                     self._update_tile(b, tap)
                 elif self._face == 2:
                     self._update_settings(b, tap)
+                elif self._face == 4:
+                    self._update_web(b, tap)
                 else:
                     self._update_capture(b, tap)
             except Exception as e:
@@ -919,9 +1419,126 @@ class ScreenGrab(app.App):
             ctx.rgb(1.0, 0.8, 0.3).move_to(0, 66).text(self.status[:20])
         ctx.rgb(0.6, 0.65, 0.8).move_to(0, 82).text(hint)
 
+    def _draw_card(self, ctx):
+        """Everything needed to connect, big enough to read across a table."""
+        web = self._web
+        dim, white, amber, green = (0.55, 0.6, 0.78), (0.97, 0.97, 1.0), (1.0, 0.82, 0.25), ICON_GREEN
+        ctx.font_size = 15
+        ctx.rgb(*dim).move_to(0, -88).text("Connect")
+
+        def line(text, y, size, colour):
+            ctx.font_size = size
+            ctx.rgb(*colour).move_to(0, y).text(text)
+
+        pin = ("PIN " + self._web_pin, white) if self._web_pin else ("No PIN - open!", ICON_RED)
+        if self._web_ap:
+            ssid, pw = self._web_ap
+            line("Join this Wi-Fi", -68, 11, dim)
+            line(ssid, -51, 19, white)
+            line("password", -34, 11, dim)
+            if "-" in pw:  # four words: two to a line, the hyphen at the break is part of it
+                parts = pw.split("-")
+                line("-".join(parts[:2]) + "-", -15, 22, amber)
+                line("-".join(parts[2:]), 8, 22, amber)
+            else:
+                line(pw, -9, 26, amber)
+            line("mobile data off, then open:", 28, 11, dim)
+            line(self.web_url().replace("http://", ""), 43, 17, green)
+            line(pin[0], 65, 19, pin[1])
+        else:
+            line("Open in a browser", -68, 12, dim)
+            line(self.web_url().replace("http://", ""), -48, 21, green)
+            nm = self._name + ".local"
+            line("or " + (nm if self.name_live() else nm + " (after restart)"), -28, 12, (0.35, 0.7, 0.45))
+            line(pin[0], 14, 30 if self._web_pin else 18, pin[1])
+            left = web.idle_left()
+            if left is not None:
+                line("off in %d:%02d" % (left // 60, left % 60), 52, 13, dim)
+            line("%d requests" % web.requests, 67, 11, dim)
+        line("OK: QR codes", 84, 11, dim)
+
+    def _qr_matrix(self, text):
+        if not self._qr or self._qr[0] != text:
+            from . import qr
+
+            size, modules = qr.best(text)
+            self._qr = (text, size, modules)
+        return self._qr[1], self._qr[2]
+
+    def _draw_qr_page(self, ctx, join):
+        web = self._web
+        ctx.font_size = 12
+        ctx.rgb(0.55, 0.6, 0.78).move_to(0, -92).text("1  Join the Wi-Fi" if join else ("2  Sign in" if self._web_ap else "Sign in"))
+        if join:
+            text = _wifi_qr(*self._web_ap)
+        elif web.pin:
+            if not web.qr_valid():
+                ctx.font_size = 22
+                ctx.rgb(*ICON_GREEN if web.signins > self._qr_signins else ICON_AMBER).move_to(0, -18).text(
+                    "Signed in" if web.signins > self._qr_signins else "Code expired")
+                ctx.font_size = 13
+                ctx.rgb(0.8, 0.85, 1.0).move_to(0, 14).text("OK: make another code")
+                return
+            text = "%s/q?t=%s" % (self.web_url(), web.qr_token)
+        else:
+            text = self.web_url()  # no PIN, so there is nothing to sign in with: just the address
+        size, modules = self._qr_matrix(text)
+        m = max(3, min(7, 150 // size))  # as big as fits, with the code's corners inside the round glass
+        side = size * m
+        x0, y0 = -(side // 2), -(side // 2) + 3
+        q = 2 * m  # the white margin a scanner needs
+        ctx.rgb(1, 1, 1).rectangle(x0 - q, y0 - q, side + 2 * q, side + 2 * q).fill()
+        ctx.rgb(0, 0, 0)
+        for y in range(size):  # a row at a time: one path of every run overflows the graphics buffer and drops the rest
+            row, x = modules[y], 0
+            ctx.begin_path()
+            while x < size:
+                if row[x]:
+                    end = x
+                    while end < size and row[end]:
+                        end += 1
+                    ctx.rectangle(x0 + x * m, y0 + y * m, (end - x) * m, m)
+                    x = end
+                else:
+                    x += 1
+            ctx.fill()
+
+    def _draw_web(self, ctx):
+        if self._wview >= 2 and self._web:
+            self._draw_qr_page(ctx, self._wview == 2 and self._web_ap is not None)
+            return
+        if self._wview and self._web:
+            self._draw_card(ctx)
+            _chevron(ctx, 96, 1)  # capture
+            _chevron(ctx, -96, -1)  # settings
+            return
+        ctx.font_size = 17
+        ctx.rgb(0.8, 0.85, 1.0).move_to(0, -88).text("Web")
+        ctx.font_size = 11
+        if self._web:
+            ctx.rgb(*ICON_GREEN).move_to(0, -69).text("on: " + self.web_url().replace("http://", ""))
+        else:
+            ctx.rgb(0.55, 0.6, 0.78).move_to(0, -69).text("off: browse, mirror, control")
+        ctx.font_size = 14
+        ctx.font_size = 13
+        for i in range(len(WEBROWS)):
+            y = -50 + 19 * i
+            sel = i == self._wset
+            if sel:
+                ctx.rgb(1.0, 0.55, 0.0).rectangle(-82, y - 9, 164, 18).fill()
+            ctx.rgb(0.0, 0.0, 0.0) if sel else ctx.rgb(0.9, 0.92, 1.0)
+            ctx.move_to(0, y).text(self._wlabel(i))
+        ctx.font_size = 11
+        if self.status or self._web_err:
+            ctx.rgb(*((1.0, 0.8, 0.3) if self.status else ICON_RED)).move_to(0, 68).text((self.status or self._web_err)[:26])
+        if self._web:
+            ctx.rgb(0.55, 0.6, 0.78).move_to(0, 84).text("UP: show details")
+        _chevron(ctx, 96, 1)  # capture
+        _chevron(ctx, -96, -1)  # settings
+
     def _draw_settings(self, ctx):
         self._draw_rows(ctx, "Settings", [self._slabel(i) for i in range(len(SETTINGS))], self._sset, "OK: change")
-        _chevron(ctx, 96, 1)  # back toward the capture tile
+        _chevron(ctx, 96, 1)  # back toward the web tile
 
     def _draw_capture(self, ctx):
         hint = "UP/DOWN  OK: done" if self._editing else "OK: change"
@@ -941,9 +1558,11 @@ class ScreenGrab(app.App):
             ctx.restore()
             self.draw_overlays(ctx)
             return
-        if self._face in (2, 3):
+        if self._face in (2, 3, 4):
             if self._face == 2:
                 self._draw_settings(ctx)
+            elif self._face == 4:
+                self._draw_web(ctx)
             else:
                 self._draw_capture(ctx)
             ctx.restore()
@@ -952,7 +1571,7 @@ class ScreenGrab(app.App):
         _chevron(ctx, 96, 1)  # storage tile
         _chevron(ctx, -96, -1)  # capture tile
         ctx.font_size = 16
-        ctx.rgb(0.8, 0.85, 1.0).move_to(0, -86).text("Screengrab")
+        ctx.rgb(*((0.4, 0.85, 1.0) if self._web else (0.8, 0.85, 1.0))).move_to(0, -86).text("Screengrab")
         if self._tl_on:
             state, color, label = "rec", ICON_RED, "Timelapse %s: %d" % (_fmt_secs(self._interval_s), self._tl_count)
         elif self._failed:
