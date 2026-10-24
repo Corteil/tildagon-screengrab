@@ -44,6 +44,11 @@ The menu items:
 - **Save to** picks where new shots go: `auto` (the first card by name, else
   flash), `flash`, or a specific card. If the pinned card isn't there, it
   falls back to the first one that is.
+- **Auto move** (off by default) moves flash shots onto a card, oldest first,
+  as soon as one is mounted, even while the app is in the background, and
+  notifies "Moved N to SD" when done. It does nothing while you're in the
+  Storage tile or if **Save to** is `flash`, and backs off for a minute if the
+  card is full.
 - **Start at boot** switches the `/boot.py` autostart on or off (off by
   default, takes effect next boot).
 - **F key** chooses what F (CANCEL) does: keep Screengrab running in the

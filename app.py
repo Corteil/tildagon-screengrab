@@ -53,8 +53,9 @@ NTP_RETRY_MS = 300000
 
 AUTOSTART_KEY = "screengrab_autostart"  # read by the /boot.py snippet, default off
 QUIT_KEY = "screengrab_cancel_quits"  # F/CANCEL quits instead of backgrounding
+AUTOMOVE_KEY = "screengrab_automove"  # move flash shots onto a card as soon as one is mounted
 CARD_KEY = "screengrab_card"  # where new shots go: "flash", a mount name like "sdcard_1", or unset = auto
-MENU = ("Move flash to SD", "Delete flash shots", "Start at boot", "F key", "Save to")
+MENU = ("Move flash to SD", "Delete flash shots", "Start at boot", "F key", "Save to", "Auto move")
 
 
 def _uuid4():
@@ -128,6 +129,9 @@ class ScreenGrab(app.App):
         self._autostart = settings.get(AUTOSTART_KEY, False)
         self._cancel_quits = settings.get(QUIT_KEY, False)
         self._card_pref = settings.get(CARD_KEY)
+        self._automove = settings.get(AUTOMOVE_KEY, False)
+        self._am_next = 0  # ticks_ms before which auto move stays idle
+        self._am_moved = 0
         self._sizes = {}  # (mount path, fs id) -> total bytes, which never change
         self._queue = []  # flash shots still to move
         self._moved = 0
@@ -311,10 +315,36 @@ class ScreenGrab(app.App):
         except Exception as e:
             print("Screengrab: clock sync failed:", e)
 
+    def _auto_move(self):
+        """Move flash shots onto a card, oldest first, one per tick, whenever a
+        card is mounted. It stays out of the way while the storage tile is
+        open, and does nothing if you chose to save to flash."""
+        if not self._automove or self._face or self._queue or self._card_pref == "flash":
+            return
+        now = time.ticks_ms()
+        if time.ticks_diff(now, self._am_next) < 0:
+            return
+        shots = self._shots(INTERNAL_DIR)
+        sd = self._sd_dir() if shots else None
+        if sd is None:  # nothing to move, or no card yet: look again shortly
+            if self._am_moved:
+                eventbus.emit(ShowNotificationEvent(message="Moved %d to SD" % self._am_moved))
+                self._am_moved = 0
+            self._am_next = time.ticks_add(now, 3000)
+            return
+        try:
+            self._move_file(INTERNAL_DIR, shots[0], sd)
+            self._am_moved += 1
+        except Exception as e:
+            self.status = "Auto move: %s" % e
+            self._am_moved = 0
+            self._am_next = time.ticks_add(now, 60000)  # e.g. card full: don't hammer it
+
     def background_update(self, delta):
         fb, self._pending = self._pending, None
         if fb is None:
             self._sync_clock()
+            self._auto_move()
             return
         try:
             self.last, external = self._save(fb)
@@ -344,6 +374,8 @@ class ScreenGrab(app.App):
             return "F key: " + ("quit" if self._cancel_quits else "background")
         if i == 4:
             return "Save to: " + (self._card_pref or "auto")
+        if i == 5:
+            return "Auto move: " + ("ON" if self._automove else "OFF")
         return MENU[i]
 
     def _quit(self):
@@ -363,6 +395,13 @@ class ScreenGrab(app.App):
             settings.set(AUTOSTART_KEY, self._autostart)
             settings.save()
             self.status = "Applies next boot"
+            return
+        if self._sel == 5:
+            self._automove = not self._automove
+            settings.set(AUTOMOVE_KEY, self._automove)
+            settings.save()
+            self._am_next = 0
+            self.status = "Moves when SD is in" if self._automove else "Auto move off"
             return
         if self._sel == 4:
             cards = self._cards()
@@ -668,10 +707,10 @@ class ScreenGrab(app.App):
         )
         ctx.font_size = 14
         for i in range(len(MENU)):
-            y = -42 + 20 * i
+            y = -44 + 18 * i
             on, sel = self._enabled(i), i == self._sel
             if sel:
-                ctx.rgb(1.0, 0.55, 0.0).rectangle(-76, y - 9, 152, 18).fill()
+                ctx.rgb(1.0, 0.55, 0.0).rectangle(-76, y - 8, 152, 16).fill()
             if on:
                 ctx.rgb(0.0, 0.0, 0.0) if sel else ctx.rgb(0.9, 0.92, 1.0)
             else:
@@ -679,8 +718,8 @@ class ScreenGrab(app.App):
             ctx.move_to(0, y).text(self._label(i))
         ctx.font_size = 12
         if self.status:
-            ctx.rgb(1.0, 0.8, 0.3).move_to(0, 58).text(self.status[:20])
-        ctx.rgb(0.6, 0.65, 0.8).move_to(0, 80).text("LEFT+RIGHT = grab")
+            ctx.rgb(1.0, 0.8, 0.3).move_to(0, 63).text(self.status[:20])
+        ctx.rgb(0.6, 0.65, 0.8).move_to(0, 81).text("LEFT+RIGHT = grab")
         ctx.restore()
         self.draw_overlays(ctx)
 
