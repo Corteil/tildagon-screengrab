@@ -147,17 +147,17 @@ class ScreenGrab(app.App):
         with open(path, "wb") as f:
             f.write(_bmp_header())
             f.write(buf)
-        return path
+        return path, external
 
     def background_update(self, delta):
         fb, self._pending = self._pending, None
         if fb is None:
             return
         try:
-            self.last = self._save(fb)
+            self.last, external = self._save(fb)
             self.count += 1
             self.status = ""
-            msg = "Saved " + self.last.rsplit("/", 1)[1]
+            msg = "Saved to %s: %s" % ("SD" if external else "flash", self.last.rsplit("/", 1)[1])
         except Exception as e:
             self.status = "Failed: %s" % e
             msg = "Screengrab failed"
