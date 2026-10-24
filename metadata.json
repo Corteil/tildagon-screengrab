@@ -1,0 +1,7 @@
+{
+    "name": "Screengrab",
+    "category": "Apps",
+    "author": "Corteil",
+    "description": "Hold LEFT+RIGHT in any app to save a screenshot as a BMP, to an SD card if present, else badge flash.",
+    "version": "1"
+}

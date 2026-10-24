@@ -1,0 +1,13 @@
+[app]
+name = "Screengrab"
+category = "Apps"
+
+[entry]
+class = "ScreenGrab"
+
+[metadata]
+author = "Corteil"
+license = "MIT"
+url = "https://github.com/Corteil/tildagon-screengrab"
+description = "Hold LEFT+RIGHT in any app to save a screenshot as a BMP, to an SD card if present, else badge flash."
+version = "1"
