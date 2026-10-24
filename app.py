@@ -2,7 +2,7 @@
 Screengrab for the Tildagon badge.
 
 Launch once and press F/CANCEL to send it to the background (or switch on
-"Start at boot" in its menu), then hold LEFT and RIGHT together in any app to
+"Start at boot" on the settings tile), then hold LEFT and RIGHT together in any app to
 save the current screen as a PNG named shot_<number>_<YYYYMMDD-HHMMSS>.png.
 The stamp is UTC (the clock is set over NTP when Wi-Fi is up); with no clock a
 random UUID stands in as the unique reference.
@@ -56,7 +56,19 @@ QUIT_KEY = "screengrab_cancel_quits"  # F/CANCEL quits instead of backgrounding
 AUTOMOVE_KEY = "screengrab_automove"  # move flash shots onto a card as soon as one is mounted
 MASK_KEY = "screengrab_mask"  # black out the corners outside the round display
 CARD_KEY = "screengrab_card"  # where new shots go: "flash", a mount name like "sdcard_1", or unset = auto
-MENU = ("Move flash to SD", "Delete flash shots", "Start at boot", "F key", "Save to", "Auto move", "Round mask")
+DELAY_KEY = "screengrab_delay"  # seconds to wait after LEFT+RIGHT before grabbing; 0 = at once
+INTERVAL_KEY = "screengrab_interval"  # seconds between time-lapse shots
+DELAYS = (0, 1, 2, 3, 5, 10, 15, 20, 30, 60)
+INTERVALS = (1, 2, 3, 5, 10, 15, 20, 30, 45, 60, 120, 300, 600, 1800, 3600)
+NOTIFY_DELAY_S = 5  # a "grab in N s" banner lasts ~3 s, so only show it if it will be gone
+
+MENU = ("Move flash to SD", "Delete flash shots")
+SETTINGS = ("Start at boot", "F key", "Save to", "Auto move")
+CAPTURE = ("Delay", "Interval", "Round mask", "Timelapse")
+
+ICON_GREEN = (0.0, 0.85, 0.3)
+ICON_AMBER = (1.0, 0.75, 0.2)
+ICON_RED = (1.0, 0.3, 0.3)
 
 
 def _uuid4():
@@ -82,6 +94,16 @@ def _fmt_bytes(n):
     return "%d KB" % (n >> 10)
 
 
+def _fmt_secs(n):
+    if n == 0:
+        return "off"
+    if n >= 3600 and n % 3600 == 0:
+        return "%d h" % (n // 3600)
+    if n >= 60 and n % 60 == 0:
+        return "%d min" % (n // 60)
+    return "%d s" % n
+
+
 def _short(name):
     """shot_0008_20261024-170312.png -> '0008 20261024-170312'."""
     num, _, rest = name[5:-4].partition("_")
@@ -102,6 +124,39 @@ def _exists(path):
         return True
     except OSError:
         return False
+
+
+def _draw_icon(ctx, cx, cy, r, state, color):
+    """A viewfinder icon: corner brackets around a shutter dot. Filled dot while
+    saving to a card, a ring while saving to flash, crossed out after a failed
+    save."""
+    w = r * 1.7
+    h = r * 1.25
+    arm = r * 0.4
+    ctx.save()
+    ctx.line_width = max(1.5, r * 0.09)
+    ctx.rgb(*color)
+    for sx in (-1, 1):
+        for sy in (-1, 1):
+            x = cx + sx * w / 2
+            y = cy + sy * h / 2
+            ctx.begin_path()
+            ctx.move_to(x, y - sy * arm)
+            ctx.line_to(x, y)
+            ctx.line_to(x - sx * arm, y)
+            ctx.stroke()
+    ctx.begin_path()
+    ctx.arc(cx, cy, r * 0.3, 0, 2 * math.pi, False)
+    if state in ("sd", "rec"):
+        ctx.fill()
+    else:
+        ctx.stroke()
+    if state == "failed":
+        ctx.begin_path()
+        ctx.move_to(cx - w / 2 - r * 0.1, cy - h / 2 - r * 0.1)
+        ctx.line_to(cx + w / 2 + r * 0.1, cy + h / 2 + r * 0.1)
+        ctx.stroke()
+    ctx.restore()
 
 
 class _Focused:
@@ -134,6 +189,19 @@ class ScreenGrab(app.App):
         self._mask = settings.get(MASK_KEY, False)
         self._am_next = 0  # ticks_ms before which auto move stays idle
         self._am_moved = 0
+        self._failed = False  # the last save failed (drives the icon)
+        self._delay_s = settings.get(DELAY_KEY, 0)
+        self._interval_s = settings.get(INTERVAL_KEY, 10)
+        self._timer_at = None  # ticks_ms when a delayed grab fires
+        self._pending_silent = False  # the pending shot is a time-lapse frame: no banner
+        self._tl_on = False  # time-lapse running (never persisted or started at boot)
+        self._tl_next = 0
+        self._tl_count = 0
+        self._editing = False  # UP/DOWN change the highlighted number on the capture tile
+        self._sset = 0  # highlighted row on the settings tile
+        self._cset = 0  # highlighted row on the capture tile
+        self._nav_dir = None  # "L"/"R": the first of LEFT/RIGHT held on the main screen
+        self._nav_spoiled = False  # both were held: that's the grab combo, not navigation
         self._sizes = {}  # (mount path, fs id) -> total bytes, which never change
         self._queue = []  # flash shots still to move
         self._moved = 0
@@ -165,8 +233,14 @@ class ScreenGrab(app.App):
                     self._held.add(name)
             if self._armed and len(self._held) == len(COMBO):
                 self._armed = False
-                # Grab now, before any notification is drawn; write later.
-                self._pending = display.get_framebuffer()
+                if self._delay_s:
+                    self._timer_at = time.ticks_add(time.ticks_ms(), self._delay_s * 1000)
+                    if self._delay_s >= NOTIFY_DELAY_S:
+                        eventbus.emit(ShowNotificationEvent(message="Grab in %d s" % self._delay_s))
+                else:
+                    # Grab now, before any notification is drawn; write later.
+                    self._pending = display.get_framebuffer()
+                    self._pending_silent = False
         except Exception as e:
             print("Screengrab:", e)
 
@@ -321,7 +395,7 @@ class ScreenGrab(app.App):
         """Move flash shots onto a card, oldest first, one per tick, whenever a
         card is mounted. It stays out of the way while the storage tile is
         open, and does nothing if you chose to save to flash."""
-        if not self._automove or self._face or self._queue or self._card_pref == "flash":
+        if not self._automove or self._face == 1 or self._queue or self._card_pref == "flash":
             return
         now = time.ticks_ms()
         if time.ticks_diff(now, self._am_next) < 0:
@@ -342,22 +416,52 @@ class ScreenGrab(app.App):
             self._am_moved = 0
             self._am_next = time.ticks_add(now, 60000)  # e.g. card full: don't hammer it
 
+    def _timers(self):
+        """Fire the self-timer and the time-lapse when they are due."""
+        now = time.ticks_ms()
+        if self._timer_at is not None and time.ticks_diff(now, self._timer_at) >= 0:
+            self._timer_at = None
+            self._pending = display.get_framebuffer()
+            self._pending_silent = False
+        elif self._tl_on and time.ticks_diff(now, self._tl_next) >= 0:
+            self._tl_next = time.ticks_add(now, self._interval_s * 1000)
+            if self._target_name(self._cards()) == "flash":
+                self._stop_timelapse("no card")
+            else:
+                self._pending = display.get_framebuffer()
+                self._pending_silent = True
+
+    def _stop_timelapse(self, why=""):
+        self._tl_on = False
+        msg = "Timelapse stopped: %d shots" % self._tl_count
+        eventbus.emit(ShowNotificationEvent(message=msg + (" (%s)" % why if why else "")))
+
     def background_update(self, delta):
+        self._timers()
         fb, self._pending = self._pending, None
         if fb is None:
             self._sync_clock()
             self._auto_move()
             return
+        silent = self._pending_silent
         try:
             self.last, external = self._save(fb)
             self.count += 1
+            if silent:
+                self._tl_count += 1
+            self._failed = False
             self.status = ""
             msg = "Saved to %s: %s" % ("SD" if external else "flash", self.last.rsplit("/", 1)[1])
         except Exception as e:
+            self._failed = True
             self.status = "Failed: %s" % e
             msg = "Screengrab failed"
             print("Screengrab:", e)
-        eventbus.emit(ShowNotificationEvent(message=msg))
+            if silent:
+                self._stop_timelapse("save failed")
+                return
+        if not silent or self._failed:
+            eventbus.emit(ShowNotificationEvent(message=msg))
 
     # --- ui ---------------------------------------------------------------
 
@@ -369,18 +473,121 @@ class ScreenGrab(app.App):
         sd, flash = self._cnt
         return i >= 2 or flash > 0 and (sd is not None if i == 0 else True)
 
-    def _label(self, i):
-        if i == 2:
+    def _slabel(self, i):
+        if i == 0:
             return "Start at boot: " + ("ON" if self._autostart else "OFF")
-        if i == 3:
+        if i == 1:
             return "F key: " + ("quit" if self._cancel_quits else "background")
-        if i == 4:
+        if i == 2:
             return "Save to: " + (self._card_pref or "auto")
-        if i == 5:
-            return "Auto move: " + ("ON" if self._automove else "OFF")
-        if i == 6:
+        return "Auto move: " + ("ON" if self._automove else "OFF")
+
+    def _clabel(self, i):
+        if i == 2:
             return "Round mask: " + ("ON" if self._mask else "OFF")
-        return MENU[i]
+        if i == 3:
+            return "Stop timelapse (%d)" % self._tl_count if self._tl_on else "Start timelapse"
+        value = _fmt_secs(self._delay_s if i == 0 else self._interval_s)
+        if self._editing and i == self._cset:
+            value = "< %s >" % value
+        return ("Delay: " if i == 0 else "Interval: ") + value
+
+    def _toggle(self, i):
+        """Change setting i on the settings tile."""
+        if i == 0:
+            self._autostart = not self._autostart
+            settings.set(AUTOSTART_KEY, self._autostart)
+            self.status = "Applies next boot"
+        elif i == 1:
+            self._cancel_quits = not self._cancel_quits
+            settings.set(QUIT_KEY, self._cancel_quits)
+            self.status = "F quits" if self._cancel_quits else "F backgrounds"
+        elif i == 2:
+            cards = self._cards()
+            options = [None, "flash"] + cards
+            k = options.index(self._card_pref) if self._card_pref in options else 0
+            self._card_pref = options[(k + 1) % len(options)]
+            settings.set(CARD_KEY, self._card_pref)
+            self._tname = self._target_name(cards)
+            self.status = "Saving to " + self._tname
+        else:
+            self._automove = not self._automove
+            settings.set(AUTOMOVE_KEY, self._automove)
+            self._am_next = 0
+            self.status = "Moves when SD is in" if self._automove else "Auto move off"
+        settings.save()
+
+    def _ctoggle(self, i):
+        """Act on row i of the capture tile."""
+        if i < 2:
+            self._editing = True  # UP/DOWN now change the number; OK or RIGHT/F finishes
+            self.status = "UP/DOWN to change"
+        elif i == 2:
+            self._mask = not self._mask
+            settings.set(MASK_KEY, self._mask)
+            settings.save()
+            self.status = "Corners masked" if self._mask else "Full square"
+        elif self._tl_on:
+            self._stop_timelapse()
+            self.status = "Timelapse stopped"
+        elif self._target_name(self._cards()) == "flash":
+            self.status = "Needs an SD card"
+        else:
+            self._tl_on, self._tl_count = True, 0
+            self._tl_next = time.ticks_add(time.ticks_ms(), self._interval_s * 1000)
+            self.status = "First shot in %d s" % self._interval_s
+
+    def _nudge(self, step):
+        """Move the number being edited one rung up or down its ladder."""
+        ladder = DELAYS if self._cset == 0 else INTERVALS
+        cur = self._delay_s if self._cset == 0 else self._interval_s
+        i = min(range(len(ladder)), key=lambda k: abs(ladder[k] - cur))
+        value = ladder[max(0, min(len(ladder) - 1, i + step))]
+        if self._cset == 0:
+            self._delay_s = value
+            settings.set(DELAY_KEY, value)
+            self.status = "Grab after %s" % _fmt_secs(value) if value else "Grab at once"
+        else:
+            self._interval_s = value
+            settings.set(INTERVAL_KEY, value)
+            self.status = "Shot every %s" % _fmt_secs(value)
+
+    def _finish_edit(self):
+        self._editing = False
+        settings.save()
+        self.status = ""
+
+    def _update_settings(self, b, tap):
+        if tap == "R":  # the settings tile sits left of the capture tile
+            self._back()
+            return
+        step = b.pressed(BUTTON_TYPES["DOWN"]) - b.pressed(BUTTON_TYPES["UP"])
+        if step:
+            self._sset = (self._sset + step) % len(SETTINGS)
+            self.status = ""
+        if b.pressed(BUTTON_TYPES["CONFIRM"]):
+            self._toggle(self._sset)
+
+    def _update_capture(self, b, tap):
+        step = b.pressed(BUTTON_TYPES["DOWN"]) - b.pressed(BUTTON_TYPES["UP"])
+        confirm = b.pressed(BUTTON_TYPES["CONFIRM"])
+        if self._editing:
+            if step:
+                self._nudge(-step)  # UP raises the number, DOWN lowers it
+            if tap == "R" or confirm:
+                self._finish_edit()
+            return
+        if tap == "R":
+            self._back()
+            return
+        if tap == "L":
+            self._face, self.status = 2, ""
+            return
+        if step:
+            self._cset = (self._cset + step) % len(CAPTURE)
+            self.status = ""
+        if confirm:
+            self._ctoggle(self._cset)
 
     def _quit(self):
         """Stop listening for the combo and close the app."""
@@ -394,40 +601,6 @@ class ScreenGrab(app.App):
 
     def _activate(self):
         self._cnt = self._counts()
-        if self._sel == 2:
-            self._autostart = not self._autostart
-            settings.set(AUTOSTART_KEY, self._autostart)
-            settings.save()
-            self.status = "Applies next boot"
-            return
-        if self._sel == 6:
-            self._mask = not self._mask
-            settings.set(MASK_KEY, self._mask)
-            settings.save()
-            self.status = "Corners masked" if self._mask else "Full square"
-            return
-        if self._sel == 5:
-            self._automove = not self._automove
-            settings.set(AUTOMOVE_KEY, self._automove)
-            settings.save()
-            self._am_next = 0
-            self.status = "Moves when SD is in" if self._automove else "Auto move off"
-            return
-        if self._sel == 4:
-            cards = self._cards()
-            options = [None, "flash"] + cards
-            i = options.index(self._card_pref) if self._card_pref in options else 0
-            self._card_pref = options[(i + 1) % len(options)]
-            settings.set(CARD_KEY, self._card_pref)
-            settings.save()
-            self.status = "Saving to " + self._target_name(cards)
-            return
-        if self._sel == 3:
-            self._cancel_quits = not self._cancel_quits
-            settings.set(QUIT_KEY, self._cancel_quits)
-            settings.save()
-            self.status = "F quits" if self._cancel_quits else "F backgrounds"
-            return
         if not self._enabled(self._sel):
             self.status = "SD not mounted" if self._sel == 0 and self._sd_dir() is None else "No flash shots"
             return
@@ -483,9 +656,14 @@ class ScreenGrab(app.App):
         self._ssel = next((i for i, st in enumerate(self._stor) if st[0] == self._tname), 0)
 
     def _back(self):
+        if self._face == 3 and self._editing:
+            self._finish_edit()
+            return
         self.status = ""
         self._fconfirm = False
-        if self._face == 1 and self._lvl == 2:
+        if self._face == 2:  # settings -> capture
+            self._face = 3
+        elif self._face == 1 and self._lvl == 2:
             self._lvl = 1
         elif self._face == 1 and self._lvl == 1:
             self._lvl = 0
@@ -493,11 +671,16 @@ class ScreenGrab(app.App):
         else:
             self._face = 0
             self._cnt_ms = 0
+            b = self.button_states
+            if b.get(BUTTON_TYPES["LEFT"]) or b.get(BUTTON_TYPES["RIGHT"]):
+                # The button that brought us back is still down: its release
+                # must not count as navigation on the main screen.
+                self._nav_dir, self._nav_spoiled = "X", True
 
-    def _update_tile(self, b):
+    def _update_tile(self, b, tap):
         down = b.pressed(BUTTON_TYPES["DOWN"]) - b.pressed(BUTTON_TYPES["UP"])
-        right = b.pressed(BUTTON_TYPES["RIGHT"])
-        if b.pressed(BUTTON_TYPES["LEFT"]):
+        right = tap == "R"
+        if tap == "L":
             self._back()
             return
         confirm = b.pressed(BUTTON_TYPES["CONFIRM"])
@@ -573,8 +756,25 @@ class ScreenGrab(app.App):
         if self._lvl == 2:
             self._show()
 
+    def _lr_tap(self, b):
+        """Returns "L" or "R" when LEFT or RIGHT is released on its own. Tiles
+        act on that rather than on the press, because LEFT+RIGHT together is
+        the grab combo: a release only counts if the other was never held too."""
+        left = b.get(BUTTON_TYPES["LEFT"])
+        right = b.get(BUTTON_TYPES["RIGHT"])
+        if left and right:
+            self._nav_spoiled = True
+        if left or right:
+            if self._nav_dir is None:
+                self._nav_dir = "L" if left else "R"
+            return None
+        direction, spoiled = self._nav_dir, self._nav_spoiled
+        self._nav_dir, self._nav_spoiled = None, False
+        return None if spoiled or direction not in ("L", "R") else direction
+
     def update(self, delta):
         b = self.button_states
+        tap = self._lr_tap(b)
         if b.get(BUTTON_TYPES["CANCEL"]):
             b.clear()
             if self._face:
@@ -587,13 +787,19 @@ class ScreenGrab(app.App):
         if self._face:
             self._ui_ms = max(0, self._ui_ms - delta)
             try:
-                self._update_tile(b)
+                if self._face == 1:
+                    self._update_tile(b, tap)
+                elif self._face == 2:
+                    self._update_settings(b, tap)
+                else:
+                    self._update_capture(b, tap)
             except Exception as e:
                 self.status = "Error: %s" % e
             return
         self._cnt_ms -= delta
         if self._cnt_ms <= 0 or self._queue:
             self._cnt = self._counts()
+            self._tname = self._target_name(self._cards())
             self._cnt_ms = 1000
         if self._queue:  # one file per tick keeps the screen alive
             try:
@@ -612,12 +818,14 @@ class ScreenGrab(app.App):
             self._sel = (self._sel + 1) % len(MENU)
             self._confirm = False
             self.status = ""
-        # RIGHT opens the storage tile, but not as half of the LEFT+RIGHT grab.
-        if b.pressed(BUTTON_TYPES["RIGHT"]) and not b.get(BUTTON_TYPES["LEFT"]):
+        if tap == "R":
             try:
                 self._open_tile()
             except Exception as e:
                 self.status = "Error: %s" % e
+            return
+        if tap == "L":
+            self._face, self._cset, self.status = 3, 0, ""
             return
         if b.pressed(BUTTON_TYPES["CONFIRM"]):
             try:
@@ -695,6 +903,32 @@ class ScreenGrab(app.App):
         ctx.rgb(0.6, 0.65, 0.8).move_to(0, 80).text(hint)
         _chevron(ctx, -96, -1)
 
+    def _draw_rows(self, ctx, title, labels, selected, hint):
+        ctx.font_size = 17
+        ctx.rgb(0.8, 0.85, 1.0).move_to(0, -82).text(title)
+        ctx.font_size = 14
+        for i in range(len(labels)):
+            y = -34 + 26 * i
+            sel = i == selected
+            if sel:
+                ctx.rgb(1.0, 0.55, 0.0).rectangle(-80, y - 11, 160, 22).fill()
+            ctx.rgb(0.0, 0.0, 0.0) if sel else ctx.rgb(0.9, 0.92, 1.0)
+            ctx.move_to(0, y).text(labels[i])
+        ctx.font_size = 12
+        if self.status:
+            ctx.rgb(1.0, 0.8, 0.3).move_to(0, 66).text(self.status[:20])
+        ctx.rgb(0.6, 0.65, 0.8).move_to(0, 82).text(hint)
+
+    def _draw_settings(self, ctx):
+        self._draw_rows(ctx, "Settings", [self._slabel(i) for i in range(len(SETTINGS))], self._sset, "OK: change")
+        _chevron(ctx, 96, 1)  # back toward the capture tile
+
+    def _draw_capture(self, ctx):
+        hint = "UP/DOWN  OK: done" if self._editing else "OK: change"
+        self._draw_rows(ctx, "Capture", [self._clabel(i) for i in range(len(CAPTURE))], self._cset, hint)
+        _chevron(ctx, 96, 1)  # main
+        _chevron(ctx, -96, -1)  # settings
+
     def draw(self, ctx):
         # The visible area is a circle a bit smaller than the 240px panel, so
         # keep text near the top and bottom short and well inside it.
@@ -702,34 +936,56 @@ class ScreenGrab(app.App):
         ctx.save()
         ctx.text_align = ctx.CENTER
         ctx.text_baseline = ctx.MIDDLE
-        if self._face:
+        if self._face == 1:
             self._draw_tile(ctx)
             ctx.restore()
             self.draw_overlays(ctx)
             return
-        _chevron(ctx, 96, 1)
+        if self._face in (2, 3):
+            if self._face == 2:
+                self._draw_settings(ctx)
+            else:
+                self._draw_capture(ctx)
+            ctx.restore()
+            self.draw_overlays(ctx)
+            return
+        _chevron(ctx, 96, 1)  # storage tile
+        _chevron(ctx, -96, -1)  # capture tile
         ctx.font_size = 16
-        ctx.rgb(0.8, 0.85, 1.0).move_to(0, -85).text("Screengrab")
-        ctx.font_size = 11
+        ctx.rgb(0.8, 0.85, 1.0).move_to(0, -86).text("Screengrab")
+        if self._tl_on:
+            state, color, label = "rec", ICON_RED, "Timelapse %s: %d" % (_fmt_secs(self._interval_s), self._tl_count)
+        elif self._failed:
+            state, color, label = "failed", ICON_RED, "Last save failed"
+        elif self._tname == "flash":
+            state, color, label = "flash", ICON_AMBER, "Saving to flash"
+        else:
+            state, color, label = "sd", ICON_GREEN, "Saving to " + self._tname
+        _draw_icon(ctx, 0, -50, 26, state, color)
+        ctx.font_size = 12
+        ctx.rgb(*color).move_to(0, -20).text(label[:22])
         sd, flash = self._cnt
-        ctx.rgb(0.4, 0.85, 0.5).move_to(0, -68).text(
-            "SD: %s   Flash: %d" % ("-" if sd is None else sd, flash)
+        ctx.font_size = 17  # shot counts, a row of their own just above the options
+        ctx.rgb(*(ICON_GREEN if sd is not None else (0.4, 0.42, 0.5))).move_to(-44, 6).text(
+            "SD: %s" % ("-" if sd is None else sd)
         )
-        ctx.font_size = 13
+        ctx.rgb(*ICON_AMBER).move_to(40, 6).text("Flash: %d" % flash)
+        ctx.font_size = 15
         for i in range(len(MENU)):
-            y = -50 + 16 * i
+            y = 30 + 26 * i
             on, sel = self._enabled(i), i == self._sel
             if sel:
-                ctx.rgb(1.0, 0.55, 0.0).rectangle(-76, y - 7, 152, 14).fill()
+                ctx.rgb(1.0, 0.55, 0.0).rectangle(-76, y - 11, 152, 22).fill()
             if on:
                 ctx.rgb(0.0, 0.0, 0.0) if sel else ctx.rgb(0.9, 0.92, 1.0)
             else:
                 ctx.rgb(0.35, 0.2, 0.0) if sel else ctx.rgb(0.4, 0.42, 0.5)
-            ctx.move_to(0, y).text(self._label(i))
+            ctx.move_to(0, y).text(MENU[i])
         ctx.font_size = 12
         if self.status:
-            ctx.rgb(1.0, 0.8, 0.3).move_to(0, 64).text(self.status[:20])
-        ctx.rgb(0.6, 0.65, 0.8).move_to(0, 82).text("LEFT+RIGHT = grab")
+            ctx.rgb(1.0, 0.8, 0.3).move_to(0, 78).text(self.status[:20])
+        ctx.font_size = 11
+        ctx.rgb(0.6, 0.65, 0.8).move_to(0, 91).text("L+R = grab")
         ctx.restore()
         self.draw_overlays(ctx)
 
