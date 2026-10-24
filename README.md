@@ -5,14 +5,14 @@ any app.
 
 1. Launch **Screengrab** from the Apps menu, then press CANCEL to send it to
    the background.
-2. In any app, hold LEFT and RIGHT together. A "Saved shot_000N.bmp"
+2. In any app, hold LEFT and RIGHT together. A "Saved to SD: shot_000N_….png"
    notification confirms it.
 
-Screenshots are 240x240 16-bit BMPs named `shot_<number>_<YYYYMMDD-HHMMSS>.bmp`
+Screenshots are 240x240 PNGs named `shot_<number>_<YYYYMMDD-HHMMSS>.png`
 (UTC). The badge clock reads 2000 until it is set, so the app tries NTP over
 Wi-Fi every 5 minutes; until then a random UUID (the part of a
 `urn:uuid:` reference after the prefix) stands in, e.g.
-`shot_0003_3f2b8c1e-5a47-4d0e-9b61-7c2d4e8a1f90.bmp`. They go to a mounted storage card if there is one, otherwise to `/screenshots`
+`shot_0003_3f2b8c1e-5a47-4d0e-9b61-7c2d4e8a1f90.png`. They go to a mounted storage card if there is one, otherwise to `/screenshots`
 in badge flash, where the newest 6 are kept. A card is any top-level mount of
 at least 256 KiB, read from the mount table, so it doesn't matter which port
 the hexpansion is in or what its app calls the mount (`/sdcard`, `/sdcard_1`,
@@ -25,10 +25,17 @@ for the **Storage tile**, and LEFT or F to come back:
 - The list shows flash and every card with its shot count and free space. The
   dot marks where new shots go. OK makes the highlighted storage the target,
   and RIGHT opens its shots.
-- In the shot list (newest first), OK deletes the highlighted shot after a
-  second OK, and RIGHT moves it to another storage (the save target if that's
-  a different one, otherwise the first other). Moved shots are renumbered into
+- In the shot list (newest first), OK **views** the highlighted shot full
+  screen and RIGHT moves it to another storage (the save target if that's a
+  different one, otherwise the first other). Moved shots are renumbered into
   the destination's sequence.
+- In the viewer, UP/DOWN flip to the previous or next shot, OK deletes the
+  shot after a second OK, RIGHT moves it, and LEFT or F goes back. The name,
+  position and key hints show for a few seconds after each key press.
+
+Shots are drawn straight from their PNG with `ctx.image()`, so there is no
+conversion step. Decoding needs roughly 500 KB of free heap; if the screen
+comes out blank the viewer says "Blank or low memory".
 
 The menu items:
 - **Move flash to SD** copies the flash shots onto the SD card (renumbered
@@ -43,7 +50,14 @@ The menu items:
   background (default), or quit it, which stops the LEFT+RIGHT listener until
   you launch it again.
 
-The frame comes from `display.get_framebuffer()`. Button events normally only
+The frame comes from `display.get_framebuffer()` and is written by `pngenc.py`
+as a compressed PNG. The firmware has no deflate compressor, so `pngenc.py`
+carries a small one in `@viper`: a single fixed-Huffman block that matches the
+pixel to the left and the pixel above. A typical UI screen is 2 to 30 KB and
+takes about 0.3 s to save; a photo-like screen can reach ~100 KB and 2 s. It
+is lossless (checked pixel for pixel).
+
+ Button events normally only
 reach the focused app, so the app registers its handlers on an always-focused
 stand-in object. Change the combo with `COMBO` in `app.py`.
 
