@@ -12,14 +12,31 @@ Screenshots are 240x240 16-bit BMPs named `shot_<number>_<YYYYMMDD-HHMMSS>.bmp`
 (UTC). The badge clock reads 2000 until it is set, so the app tries NTP over
 Wi-Fi every 5 minutes; until then a random UUID (the part of a
 `urn:uuid:` reference after the prefix) stands in, e.g.
-`shot_0003_3f2b8c1e-5a47-4d0e-9b61-7c2d4e8a1f90.bmp`. They go to `/sd` or `/sdcard` if one is mounted (in a
-`screenshots` folder, no limit), otherwise to `/screenshots` in badge flash,
-where the newest 6 are kept.
+`shot_0003_3f2b8c1e-5a47-4d0e-9b61-7c2d4e8a1f90.bmp`. They go to a mounted storage card if there is one, otherwise to `/screenshots`
+in badge flash, where the newest 6 are kept. A card is any top-level mount of
+at least 256 KiB, read from the mount table, so it doesn't matter which port
+the hexpansion is in or what its app calls the mount (`/sdcard`, `/sdcard_1`,
+...). The tiny hexpansion EEPROM mounts are skipped. Shots go in a
+`screenshots` folder on the card, with no limit.
 
-Open the app for a menu (UP/DOWN to choose, CONFIRM to run):
+Open the app for a menu (UP/DOWN to choose, CONFIRM to run). Press RIGHT on it
+for the **Storage tile**, and LEFT or F to come back:
+
+- The list shows flash and every card with its shot count and free space. The
+  dot marks where new shots go. OK makes the highlighted storage the target,
+  and RIGHT opens its shots.
+- In the shot list (newest first), OK deletes the highlighted shot after a
+  second OK, and RIGHT moves it to another storage (the save target if that's
+  a different one, otherwise the first other). Moved shots are renumbered into
+  the destination's sequence.
+
+The menu items:
 - **Move flash to SD** copies the flash shots onto the SD card (renumbered
   into its sequence) and deletes them from flash.
 - **Delete flash shots** deletes them all after a second CONFIRM.
+- **Save to** picks where new shots go: `auto` (the first card by name, else
+  flash), `flash`, or a specific card. If the pinned card isn't there, it
+  falls back to the first one that is.
 - **Start at boot** switches the `/boot.py` autostart on or off (off by
   default, takes effect next boot).
 - **F key** chooses what F (CANCEL) does: keep Screengrab running in the

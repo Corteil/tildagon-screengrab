@@ -1,13 +1,20 @@
 """
 Screengrab for the Tildagon badge.
 
-Launch once, press CANCEL to send it to the background (or start it at boot
-from /boot.py, see the README; the app's menu switches that on and off), then hold LEFT and RIGHT together in any app to save the current screen as a BMP, named
-shot_<number>_<YYYYMMDD-HHMMSS>.bmp (UTC; the clock is set over NTP when
-Wi-Fi is up, otherwise a random UUID is used as the unique reference).
-Screenshots go to /sd or /sdcard when one is mounted, otherwise /screenshots
-in badge flash (oldest are deleted to keep MAX_INTERNAL). Open the app to
-move the flash shots onto the SD card or delete them.
+Launch once and press F/CANCEL to send it to the background (or switch on
+"Start at boot" in its menu), then hold LEFT and RIGHT together in any app to
+save the current screen as a BMP named shot_<number>_<YYYYMMDD-HHMMSS>.bmp.
+The stamp is UTC (the clock is set over NTP when Wi-Fi is up); with no clock a
+random UUID stands in as the unique reference.
+
+Shots go to a mounted storage card when there is one: any top-level mount of
+at least 256 KiB (found from the mount table, so the port and mount name
+don't matter), and the menu can pin one when several are mounted. Otherwise
+they go to /screenshots in badge flash (oldest are deleted to keep
+MAX_INTERNAL). Open the app to move the flash shots onto the card or delete
+them, or press RIGHT for the storage tile: every storage with its shot count
+and free space, a choice of where new shots go, and a browser to delete or
+move single shots.
 
 The frame comes from display.get_framebuffer() (240x240 RGB565,
 byte-swapped), written as a 16-bit BMP.
@@ -17,6 +24,7 @@ handlers against an always-focused stand-in object instead of the app.
 
 License: MIT
 """
+import math
 import os
 import time
 
@@ -24,6 +32,7 @@ import app
 import display
 import micropython
 import settings
+import vfs
 
 from events.input import Buttons, BUTTON_TYPES, ButtonDownEvent, ButtonUpEvent
 from system.eventbus import eventbus
@@ -31,7 +40,7 @@ from system.notification.events import ShowNotificationEvent
 
 W = H = 240
 COMBO = ("LEFT", "RIGHT")
-EXTERNAL_DIRS = ("/sd", "/sdcard")
+MIN_CARD_BYTES = 256 << 10  # smaller mounts (hexpansion EEPROMs, ~8 KB) aren't storage
 INTERNAL_DIR = "/screenshots"
 MAX_INTERNAL = 6
 SLACK = 16384  # free space to leave on the filesystem
@@ -40,7 +49,8 @@ NTP_RETRY_MS = 300000
 
 AUTOSTART_KEY = "screengrab_autostart"  # read by the /boot.py snippet, default off
 QUIT_KEY = "screengrab_cancel_quits"  # F/CANCEL quits instead of backgrounding
-MENU = ("Move flash to SD", "Delete flash shots", "Start at boot", "F key")
+CARD_KEY = "screengrab_card"  # where new shots go: "flash", a mount name like "sdcard_1", or unset = auto
+MENU = ("Move flash to SD", "Delete flash shots", "Start at boot", "F key", "Save to")
 
 
 @micropython.viper
@@ -87,6 +97,28 @@ def _stamp():
     return _uuid4()  # no clock: a unique reference instead (the UUID of urn:uuid:...)
 
 
+def _fmt_bytes(n):
+    if n >= 1 << 30:
+        return "%.1f GB" % (n / (1 << 30))
+    if n >= 1 << 20:
+        return "%d MB" % (n >> 20)
+    return "%d KB" % (n >> 10)
+
+
+def _short(name):
+    """shot_0008_20261024-170312.bmp -> '0008 20261024-170312'."""
+    num, _, rest = name[5:-4].partition("_")
+    if len(rest) > 15:
+        rest = rest[:8]  # a UUID: its first 8 hex digits are plenty
+    return num + " " + rest if rest else num
+
+
+def _chevron(ctx, x, direction):
+    ctx.rgb(0.45, 0.5, 0.65).begin_path()
+    ctx.move_to(x - 4 * direction, -7).line_to(x + 4 * direction, 0).line_to(x - 4 * direction, 7)
+    ctx.close_path().fill()
+
+
 def _exists(path):
     try:
         os.stat(path)
@@ -120,8 +152,20 @@ class ScreenGrab(app.App):
         self._confirm = False
         self._autostart = settings.get(AUTOSTART_KEY, False)
         self._cancel_quits = settings.get(QUIT_KEY, False)
+        self._card_pref = settings.get(CARD_KEY)
+        self._sizes = {}  # (mount path, fs id) -> total bytes, which never change
         self._queue = []  # flash shots still to move
         self._moved = 0
+        # Storage tile: face 0 is the main menu, face 1 the storage tile, whose
+        # level 0 lists storages and level 1 the shots on one of them.
+        self._face = 0
+        self._lvl = 0
+        self._stor = []  # (name, dir, shot count, free bytes)
+        self._tname = "flash"
+        self._ssel = 0
+        self._files = []
+        self._fsel = 0
+        self._fconfirm = False
         self._ntp_next = time.ticks_add(time.ticks_ms(), 30000)
         if ScreenGrab._primary is None:
             ScreenGrab._primary = self
@@ -151,25 +195,58 @@ class ScreenGrab(app.App):
 
     # --- storage ----------------------------------------------------------
 
+    def _cards(self):
+        """Names of top-level mounts that look like storage cards: at least
+        MIN_CARD_BYTES, which skips the tiny hexpansion EEPROM mounts. The
+        mount table is used rather than statvfs on every root entry, because
+        statvfs on the badge's own flash takes ~700 ms each."""
+        names = []
+        for fs, path in vfs.mount():
+            if path == "/" or path.count("/") != 1:
+                continue
+            key = (path, id(fs))
+            if key not in self._sizes:
+                try:
+                    v = os.statvfs(path)
+                    self._sizes[key] = v[1] * v[2]
+                except OSError:
+                    continue
+            if self._sizes[key] >= MIN_CARD_BYTES:
+                names.append(path[1:])
+        return sorted(names)
+
     def _sd_dir(self, create=False):
-        for d in EXTERNAL_DIRS:
-            if _exists(d):
-                d += "/screenshots"
-                if create and not _exists(d):
-                    os.mkdir(d)
-                return d
-        return None
+        cards = self._cards()
+        if not cards:
+            return None
+        name = self._card_pref if self._card_pref in cards else cards[0]
+        d = "/" + name + "/screenshots"
+        if create and not _exists(d):
+            os.mkdir(d)
+        return d
 
     def _flash_dir(self, create=False):
         if create and not _exists(INTERNAL_DIR):
             os.mkdir(INTERNAL_DIR)
         return INTERNAL_DIR
 
+    def _target_name(self, cards):
+        pref = self._card_pref
+        if pref == "flash" or not cards:
+            return "flash"
+        return pref if pref in cards else cards[0]
+
     def _target(self):
-        d = self._sd_dir(create=True)
-        if d:
-            return d, True
-        return self._flash_dir(create=True), False
+        name = self._target_name(self._cards())
+        if name == "flash":
+            return self._flash_dir(create=True), False
+        d = "/%s/screenshots" % name
+        if not _exists(d):
+            os.mkdir(d)
+        return d, True
+
+    def _storages(self):
+        return [("flash", INTERNAL_DIR)] + [(n, "/%s/screenshots" % n) for n in self._cards()]
 
     def _shots(self, d):
         try:
@@ -203,18 +280,16 @@ class ScreenGrab(app.App):
             f.write(buf)
         return path, external
 
-    def _move_one(self):
-        """Copy the next queued flash shot to the SD card, then delete it."""
-        sd = self._sd_dir(create=True)
-        if sd is None:
-            raise OSError("SD removed")
-        name = self._queue[0]
-        src = INTERNAL_DIR + "/" + name
+    def _move_file(self, src_dir, name, dst_dir):
+        """Copy a shot into dst_dir, renumbered into its sequence (keeping any
+        timestamp suffix), verify the copy, then delete the original."""
+        if not _exists(dst_dir):
+            os.mkdir(dst_dir)
+        src = src_dir + "/" + name
         size = os.stat(src)[6]
-        if self._free(sd) < size + SLACK:
-            raise OSError("SD full")
-        # Renumber into the SD sequence, keeping any timestamp suffix.
-        dst = "%s/shot_%04d%s" % (sd, self._next_number(self._shots(sd)), name[9:])
+        if self._free(dst_dir) < size + SLACK:
+            raise OSError("destination full")
+        dst = "%s/shot_%04d%s" % (dst_dir, self._next_number(self._shots(dst_dir)), name[9:])
         buf = bytearray(4096)
         with open(src, "rb") as fi, open(dst, "wb") as fo:
             while True:
@@ -226,6 +301,14 @@ class ScreenGrab(app.App):
             os.remove(dst)
             raise OSError("copy failed")
         os.remove(src)
+        return dst
+
+    def _move_one(self):
+        """Move the next queued flash shot to the SD card."""
+        sd = self._sd_dir()
+        if sd is None:
+            raise OSError("SD removed")
+        self._move_file(INTERNAL_DIR, self._queue[0], sd)
         self._queue.pop(0)
         self._moved += 1
 
@@ -277,6 +360,8 @@ class ScreenGrab(app.App):
             return "Start at boot: " + ("ON" if self._autostart else "OFF")
         if i == 3:
             return "F key: " + ("quit" if self._cancel_quits else "background")
+        if i == 4:
+            return "Save to: " + (self._card_pref or "auto")
         return MENU[i]
 
     def _quit(self):
@@ -296,6 +381,15 @@ class ScreenGrab(app.App):
             settings.set(AUTOSTART_KEY, self._autostart)
             settings.save()
             self.status = "Applies next boot"
+            return
+        if self._sel == 4:
+            cards = self._cards()
+            options = [None, "flash"] + cards
+            i = options.index(self._card_pref) if self._card_pref in options else 0
+            self._card_pref = options[(i + 1) % len(options)]
+            settings.set(CARD_KEY, self._card_pref)
+            settings.save()
+            self.status = "Saving to " + self._target_name(cards)
             return
         if self._sel == 3:
             self._cancel_quits = not self._cancel_quits
@@ -321,14 +415,102 @@ class ScreenGrab(app.App):
                 n += 1
             self.status = "Deleted %d" % n
 
+    def _scan_storages(self):
+        cards = self._cards()
+        self._tname = self._target_name(cards)
+        self._stor = []
+        for name, d in self._storages():
+            root = "/" if name == "flash" else "/" + name
+            self._stor.append((name, d, len(self._shots(d)), self._free(root)))
+        self._ssel = min(self._ssel, len(self._stor) - 1)
+
+    def _open_tile(self):
+        self._face, self._lvl, self.status = 1, 0, ""
+        self._scan_storages()
+        self._ssel = next((i for i, st in enumerate(self._stor) if st[0] == self._tname), 0)
+
+    def _back(self):
+        self.status = ""
+        self._fconfirm = False
+        if self._face == 1 and self._lvl == 1:
+            self._lvl = 0
+            self._scan_storages()
+        else:
+            self._face = 0
+            self._cnt_ms = 0
+
+    def _update_tile(self, b):
+        down = b.pressed(BUTTON_TYPES["DOWN"]) - b.pressed(BUTTON_TYPES["UP"])
+        right = b.pressed(BUTTON_TYPES["RIGHT"])
+        if b.pressed(BUTTON_TYPES["LEFT"]):
+            self._back()
+            return
+        confirm = b.pressed(BUTTON_TYPES["CONFIRM"])
+        if self._lvl == 0:
+            self._ssel = (self._ssel + down) % len(self._stor)
+            if down:
+                self.status = ""
+            name, d, n, free = self._stor[self._ssel]
+            if confirm:
+                self._card_pref = name
+                settings.set(CARD_KEY, name)
+                settings.save()
+                self._tname = name
+                self.status = "Saving to " + name
+            elif right:
+                if n == 0:
+                    self.status = "No shots here"
+                else:
+                    self._files = self._shots(d)[::-1]  # newest first
+                    self._fsel, self._lvl, self.status = 0, 1, ""
+            return
+        # level 1: the shots on one storage
+        name, d, n, free = self._stor[self._ssel]
+        if down:
+            self._fsel = (self._fsel + down) % max(1, len(self._files))
+            self._fconfirm = False
+            self.status = ""
+        if not self._files:
+            self.status = "No shots"
+            return
+        f = self._files[self._fsel]
+        if confirm:
+            if not self._fconfirm:
+                self._fconfirm = True
+                self.status = "CONFIRM to delete"
+            else:
+                os.remove(d + "/" + f)
+                self._files.pop(self._fsel)
+                self._fsel = min(self._fsel, max(0, len(self._files) - 1))
+                self._fconfirm = False
+                self.status = "Deleted"
+        elif right:
+            others = [st for st in self._stor if st[0] != name]
+            if not others:
+                self.status = "No other storage"
+                return
+            dest = next((st for st in others if st[0] == self._tname), others[0])
+            self._move_file(d, f, dest[1])
+            self._files.pop(self._fsel)
+            self._fsel = min(self._fsel, max(0, len(self._files) - 1))
+            self.status = "Moved to " + dest[0]
+
     def update(self, delta):
         b = self.button_states
         if b.get(BUTTON_TYPES["CANCEL"]):
             b.clear()
-            if self._cancel_quits:
+            if self._face:
+                self._back()
+            elif self._cancel_quits:
                 self._quit()
             else:
                 self.minimise()
+            return
+        if self._face:
+            try:
+                self._update_tile(b)
+            except Exception as e:
+                self.status = "Error: %s" % e
             return
         self._cnt_ms -= delta
         if self._cnt_ms <= 0 or self._queue:
@@ -351,12 +533,68 @@ class ScreenGrab(app.App):
             self._sel = (self._sel + 1) % len(MENU)
             self._confirm = False
             self.status = ""
+        # RIGHT opens the storage tile, but not as half of the LEFT+RIGHT grab.
+        if b.pressed(BUTTON_TYPES["RIGHT"]) and not b.get(BUTTON_TYPES["LEFT"]):
+            try:
+                self._open_tile()
+            except Exception as e:
+                self.status = "Error: %s" % e
+            return
         if b.pressed(BUTTON_TYPES["CONFIRM"]):
             try:
                 self._activate()
             except Exception as e:
                 self.status = "Error: %s" % e
             self._cnt_ms = 0
+
+    def _draw_tile(self, ctx):
+        ctx.font_size = 17
+        ctx.rgb(0.8, 0.85, 1.0)
+        if self._lvl == 0:
+            ctx.move_to(0, -82).text("Storage")
+            ctx.font_size = 11
+            for k in range(3):  # three storages visible at a time
+                i = k + max(0, min(self._ssel - 2, len(self._stor) - 3))
+                if i >= len(self._stor):
+                    break
+                name, d, n, free = self._stor[i]
+                y = -40 + 30 * k
+                sel = i == self._ssel
+                if sel:
+                    ctx.rgb(1.0, 0.55, 0.0).rectangle(-78, y - 13, 156, 26).fill()
+                ctx.rgb(0.0, 0.0, 0.0) if sel else ctx.rgb(0.9, 0.92, 1.0)
+                if name == self._tname:  # where new shots go
+                    ctx.begin_path()
+                    ctx.arc(-66, y, 3.5, 0, 2 * math.pi, False)
+                    ctx.fill()
+                ctx.font_size = 14
+                ctx.move_to(0, y - 5).text(name)
+                ctx.font_size = 11
+                ctx.move_to(0, y + 8).text("%d shots, %s free" % (n, _fmt_bytes(free)))
+            hint = "OK: save here   R: files"
+        else:
+            name, d, n, free = self._stor[self._ssel]
+            ctx.move_to(0, -82).text(name)
+            ctx.font_size = 12
+            ctx.rgb(0.4, 0.85, 0.5).move_to(0, -63).text("%d shots" % len(self._files))
+            ctx.font_size = 13
+            top = max(0, min(self._fsel - 2, len(self._files) - 5))
+            for k in range(5):
+                i = top + k
+                if i >= len(self._files):
+                    break
+                y = -42 + 20 * k
+                sel = i == self._fsel
+                if sel:
+                    ctx.rgb(1.0, 0.55, 0.0).rectangle(-76, y - 9, 152, 18).fill()
+                ctx.rgb(0.0, 0.0, 0.0) if sel else ctx.rgb(0.9, 0.92, 1.0)
+                ctx.move_to(0, y).text(_short(self._files[i]))
+            hint = "OK: delete   R: move"
+        ctx.font_size = 12
+        if self.status:
+            ctx.rgb(1.0, 0.8, 0.3).move_to(0, 58).text(self.status[:20])
+        ctx.rgb(0.6, 0.65, 0.8).move_to(0, 80).text(hint)
+        _chevron(ctx, -96, -1)
 
     def draw(self, ctx):
         # The visible area is a circle a bit smaller than the 240px panel, so
@@ -365,19 +603,25 @@ class ScreenGrab(app.App):
         ctx.save()
         ctx.text_align = ctx.CENTER
         ctx.text_baseline = ctx.MIDDLE
-        ctx.font_size = 18
-        ctx.rgb(0.8, 0.85, 1.0).move_to(0, -80).text("Screengrab")
-        ctx.font_size = 13
+        if self._face:
+            self._draw_tile(ctx)
+            ctx.restore()
+            self.draw_overlays(ctx)
+            return
+        _chevron(ctx, 96, 1)
+        ctx.font_size = 17
+        ctx.rgb(0.8, 0.85, 1.0).move_to(0, -82).text("Screengrab")
+        ctx.font_size = 12
         sd, flash = self._cnt
-        ctx.rgb(0.4, 0.85, 0.5).move_to(0, -60).text(
+        ctx.rgb(0.4, 0.85, 0.5).move_to(0, -63).text(
             "SD: %s   Flash: %d" % ("-" if sd is None else sd, flash)
         )
-        ctx.font_size = 15
+        ctx.font_size = 14
         for i in range(len(MENU)):
-            y = -36 + 22 * i
+            y = -42 + 20 * i
             on, sel = self._enabled(i), i == self._sel
             if sel:
-                ctx.rgb(1.0, 0.55, 0.0).rectangle(-76, y - 10, 152, 20).fill()
+                ctx.rgb(1.0, 0.55, 0.0).rectangle(-76, y - 9, 152, 18).fill()
             if on:
                 ctx.rgb(0.0, 0.0, 0.0) if sel else ctx.rgb(0.9, 0.92, 1.0)
             else:
@@ -385,7 +629,7 @@ class ScreenGrab(app.App):
             ctx.move_to(0, y).text(self._label(i))
         ctx.font_size = 12
         if self.status:
-            ctx.rgb(1.0, 0.8, 0.3).move_to(0, 56).text(self.status[:20])
+            ctx.rgb(1.0, 0.8, 0.3).move_to(0, 58).text(self.status[:20])
         ctx.rgb(0.6, 0.65, 0.8).move_to(0, 80).text("LEFT+RIGHT = grab")
         ctx.restore()
         self.draw_overlays(ctx)
