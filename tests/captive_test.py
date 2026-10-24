@@ -2,7 +2,10 @@
 """Tests for the hotspot's captive-portal behaviour, against a server started with captive mode on
 (the badge's own hotspot does this; a test setup can bind the same server to the home-Wi-Fi address).
 
-    python3 tests/captive_test.py <badge ip>
+    python3 tests/captive_test.py <badge ip> [none] [portal|quiet]
+
+portal (the hotspot's default): the checks are redirected to the badge's page, so the phone shows
+its sign-in screen. quiet: they are answered "online" (204, Apple's Success page, ...).
 
 Checks the DNS responder (raw UDP queries on port 53), the answers to the connectivity checks that
 Android, Apple, Windows, Firefox and Linux make when they join a network, the redirect of any other
@@ -65,7 +68,8 @@ def requests_so_far():
     return json.loads(d)["requests"] if r.status == 200 else None
 
 
-PIN = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] != "none" else ""
+PIN = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] not in ("none", "portal", "quiet") else ""
+PORTAL = "portal" in sys.argv[2:]
 ipb = bytes(int(x) for x in IP.split("."))
 
 print("== DNS: every name goes to the badge")
@@ -122,9 +126,12 @@ probes = [
 ]
 for path, host, status, body in probes:
     s_, d, r = http_get(path, host)
-    check("%s (Host: %s) -> %d" % (path, host, status), s_ == status and body in d and r.getheader("Content-Length") == str(len(d)), "%d %r" % (s_, d[:40]))
+    if PORTAL:
+        check("%s (Host: %s) -> redirect to the page" % (path, host), s_ == 302 and r.getheader("Location") == "http://%s/" % IP and d == b"", s_)
+    else:
+        check("%s (Host: %s) -> %d" % (path, host, status), s_ == status and body in d and r.getheader("Content-Length") == str(len(d)), "%d %r" % (s_, d[:40]))
 s_, d, r = http_get("/generate_204", host=IP)
-check("the same check on the badge's own address works too", s_ == 204)
+check("the same check on the badge's own address is handled the same way", s_ == (302 if PORTAL else 204), s_)
 
 print("== any other name is sent to the badge")
 for path in ("/", "/whatever", "/api/status", "/shot/flash/x.png"):

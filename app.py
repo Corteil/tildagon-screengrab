@@ -74,6 +74,7 @@ NAME_KEY = "screengrab_web_name"  # the badge's network name: <name>.local on yo
 DEFAULT_NAME = "tildagon"
 NAME_ALLOWED = "abcdefghijklmnopqrstuvwxyz0123456789-"
 NAME_MAX = 24
+WEB_PORTAL_KEY = "screengrab_web_portal"  # hotspot: redirect phones' connectivity checks to the page (default on)
 WEB_WORDS_KEY = "screengrab_web_words"  # make that password from four short words instead of 8 characters
 WEB_IDLES = (0, 1, 5, 10, 30, 60)
 SHOT_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-."
@@ -237,6 +238,7 @@ class ScreenGrab(app.App):
         self._web_net = settings.get(WEB_NET_KEY, "wifi")
         self._web_idle = settings.get(WEB_IDLE_KEY, 10)
         self._web_words = settings.get(WEB_WORDS_KEY, False)
+        self._web_portal = settings.get(WEB_PORTAL_KEY, True)
         name = settings.get(NAME_KEY, DEFAULT_NAME)
         self._name = name if valid_name(name) else DEFAULT_NAME
         self._tdlg = None  # the firmware's TextDialog while the name is being typed
@@ -467,7 +469,7 @@ class ScreenGrab(app.App):
             gc.collect()
             self.apply_name()
             host = wifi.accesspoint_get_ip() if self._web_ap else wifi.get_ip()
-            self._web = WebServer(self, self._web_pin, self._web_idle * 60, host=host, captive=self._web_ap is not None)
+            self._web = WebServer(self, self._web_pin, self._web_idle * 60, host=host, captive=self._web_ap is not None, portal=self._web_portal)
             self._web.start()
             self._web_err = ""
             self._wview = 1  # show the big connection card
@@ -748,7 +750,9 @@ class ScreenGrab(app.App):
         if i == 1:
             return "PIN: " + ("ON" if self._web_pin_on else "OFF")
         if i == 2:
-            return "Network: " + ("Hotspot" if self._web_net == "hotspot" else "Wi-Fi")
+            if self._web_net != "hotspot":
+                return "Network: Wi-Fi"
+            return "Network: Hotspot" if self._web_portal else "Network: Hotspot (quiet)"
         if i == 3:
             return "AP pass: " + ("4 words" if self._web_words else "8 chars")
         if i == 5:
@@ -786,11 +790,19 @@ class ScreenGrab(app.App):
             self._wrestart()
             self.status = "PIN required" if self._web_pin_on else "Open: no PIN!"
         elif i == 2:
-            self._web_net = "wifi" if self._web_net == "hotspot" else "hotspot"
+            # Wi-Fi -> Hotspot (the phone is shown a sign-in page) -> Hotspot (quiet: says "online") -> Wi-Fi
+            if self._web_net != "hotspot":
+                self._web_net, self._web_portal = "hotspot", True
+            elif self._web_portal:
+                self._web_portal = False
+            else:
+                self._web_net, self._web_portal = "wifi", True
             settings.set(WEB_NET_KEY, self._web_net)
+            settings.set(WEB_PORTAL_KEY, self._web_portal)
             settings.save()
             self._wrestart()
-            self.status = "Badge Wi-Fi hotspot" if self._web_net == "hotspot" else "Your Wi-Fi"
+            self.status = ("Your Wi-Fi" if self._web_net != "hotspot" else
+                           "Phone gets a sign-in page" if self._web_portal else "Says 'online' to phones")
         elif i == 3:
             self._web_words = not self._web_words
             settings.set(WEB_WORDS_KEY, self._web_words)
@@ -1442,7 +1454,7 @@ class ScreenGrab(app.App):
                 line("-".join(parts[2:]), 8, 22, amber)
             else:
                 line(pw, -9, 26, amber)
-            line("mobile data off, then open:", 28, 11, dim)
+            line("tap Sign in, or open:" if self._web_portal else "mobile data off, then open:", 28, 11, dim)
             line(self.web_url().replace("http://", ""), 43, 17, green)
             line(pin[0], 65, 19, pin[1])
         else:

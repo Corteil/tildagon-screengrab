@@ -126,11 +126,12 @@ The options are:
 - **PIN: ON/OFF** (on by default) asks for a six-digit PIN, shown only on the
   badge and new each time the server starts. With it off, anyone on the network
   can see your screen and the card warns "No PIN - open!".
-- **Network: Wi-Fi/Hotspot.** *Wi-Fi* joins whatever network the badge is
+- **Network** cycles three ways. *Wi-Fi* joins whatever network the badge is
   already on and answers only on that address. *Hotspot* makes the badge its own
   network (`Tildagon-xxxx`, WPA2) at `http://192.168.4.1` for phones at events
-  with no shared Wi-Fi, and answers only there. See **Hotspot and phones**
-  below: a phone joined to it has no internet, so the badge helps it cope.
+  with no shared Wi-Fi, and answers only there; the phone is shown a sign-in
+  page (see **Hotspot and phones**). *Hotspot (quiet)* is the same network but
+  tells phones it is online instead.
 - **AP pass: 8 chars/4 words** chooses the hotspot password: eight random
   letters and digits with the look-alikes (0 O 1 I L) left out, or four random
   short words such as `acid-acre-army-bath`, which are easier to read out and
@@ -161,25 +162,36 @@ go, round mask). `/#live` and `/#control` open those tabs directly.
 
 A phone joined to the badge's hotspot finds it has no internet, and Android in
 particular then sends the browser's traffic over mobile data, which can't reach
-`192.168.4.1`: the page times out, or the browser says `ERR_EMPTY_RESPONSE`.
-Turning mobile data off fixes it. To make that unnecessary the hotspot behaves
-like a captive portal:
+`192.168.4.1`: the page times out, or Chrome says `ERR_EMPTY_RESPONSE`. Logging
+a real Android phone's traffic showed why the obvious fix doesn't work. The
+phone does use the hotspot's DNS and probes `connectivitycheck.gstatic.com`,
+`www.google.com/gen_204` and `play.googleapis.com/generate_204` again and again,
+and answering "204, online" is never enough, because Android also probes over
+HTTPS, which the badge can't answer without a real certificate. So it never
+accepts the network as having internet, and its browser stays on mobile data.
+
+So the hotspot behaves like a hotel Wi-Fi (a captive portal):
 
 - its DHCP hands out the badge as the DNS server, and a tiny DNS responder
   (in its own thread, so a busy screen can't make it drop queries) answers
   every name with the badge's address;
-- it answers the connectivity checks phones and laptops make on joining
-  (Android's `/generate_204`, Apple's "Success" page, Windows, Firefox and
-  Linux ones) so they don't conclude the network is dead, and these don't count
-  as use, so they can't keep the server awake;
+- the connectivity checks phones and laptops make on joining (Android's
+  `/generate_204`, Apple's "Success" page, Windows, Firefox and Linux ones) are
+  answered with a **redirect to the page**, so the phone shows its own "Sign in
+  to Wi-Fi network" screen. That screen is bound to the hotspot, so it works
+  with mobile data on. iPhones and laptops open it by themselves; on Android
+  tap the notification. Enter the PIN from the badge there;
+- these checks don't count as use, so they can't keep the server awake;
 - any other name that arrives through that DNS is redirected to the badge's
   page (and non-GET requests to a wrong name are refused, which also blocks DNS
   rebinding).
 
-How well this keeps a phone on the hotspot varies by Android version, and I
-could not join the hotspot from the development machine to try a phone, so the
-connection card still says "mobile data off" as a fallback. `tests/captive_test.py`
-checks the responder and the answers against a server in the same mode.
+What does not change: a link opened in the phone's ordinary browser (including
+the **sign-in QR code**, which opens in Chrome) still uses mobile data on
+Android, so for that, or for the sign-in screen's limits, turn mobile data off.
+*Hotspot (quiet)* answers the checks "online" instead, which satisfies Apple and
+laptops but not Android. `tests/captive_test.py` checks the responder, the
+redirects and the quiet answers in both modes against a server in the same mode.
 
 ### How it behaves
 
@@ -230,8 +242,9 @@ payloads at both error correction levels, and decodes renderings with
 0.4 to 0.75 s each. The codes drawn on the badge's real screen were also
 grabbed and decoded with `zxing-cpp`, but not yet scanned by a phone camera.
 
-`tests/captive_test.py` (32 checks: the hotspot's DNS answers, connectivity
-checks and redirects, run against a server started in the same mode),
+`tests/captive_test.py` (32 checks, in portal and in quiet mode: the hotspot's DNS
+answers, connectivity checks and redirects, run against a server started in the
+same mode),
 `tests/web_test.py` (about 90 checks: auth, lockout, the one-time sign-in code, path
 traversal, malformed requests, every action, live frames, concurrency, a silent
 client, leaks) and

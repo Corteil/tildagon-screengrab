@@ -6,8 +6,11 @@ It is a small HTTP/1.0 server built on non-blocking sockets driven from an
 asyncio task. In hotspot mode it also behaves like a captive portal: a tiny DNS
 responder sends every name to the badge, and the connectivity checks phones make
 when they join a network (Android's generate_204, Apple's "Success" page, ...)
-are answered, so the phone treats the hotspot as a usable network and keeps its
-browser on it instead of falling back to mobile data. MicroPython's asyncio stream server takes 0.6 to 1 s to answer
+are answered. Android also probes over HTTPS, which the badge can't answer, so it
+never accepts the hotspot as having internet and sends the browser over mobile
+data. In "portal" mode (the default) the checks are therefore answered with a
+redirect to the page, like a hotel Wi-Fi: the phone shows its own "Sign in to
+Wi-Fi" screen, which is bound to the hotspot and so works with mobile data on. MicroPython's asyncio stream server takes 0.6 to 1 s to answer
 each request on this badge (measured: a raw socket answers in 40-170 ms), so
 the streams are not used.
 
@@ -97,6 +100,16 @@ def dns_reply(query, ip):
             + bytes(query[12:i + 5]) + answer)
 
 
+def dns_name(query):
+    """The name and type being asked for, for the console log: 'A example.com'."""
+    i, labels = 12, []
+    while i < len(query) and query[i]:
+        labels.append(bytes(query[i + 1:i + 1 + query[i]]).decode("utf-8", "replace"))
+        i += query[i] + 1
+    qtype = (query[i + 1] << 8) | query[i + 2] if i + 3 <= len(query) else 0
+    return "%s %s" % ({1: "A", 28: "AAAA", 65: "HTTPS"}.get(qtype, str(qtype)), ".".join(labels))
+
+
 class _Reply(Exception):
     """Stop handling a request and answer with this status and message."""
 
@@ -170,8 +183,9 @@ def password(length=8):
 
 
 class WebServer:
-    def __init__(self, app, pin=None, idle_s=600, port=PORT, host="0.0.0.0", captive=False):
+    def __init__(self, app, pin=None, idle_s=600, port=PORT, host="0.0.0.0", captive=False, portal=True):
         self.app = app
+        self.portal = portal  # captive mode only: send the connectivity checks to the page (else say "yes, internet")
         self.captive = captive  # hotspot: answer DNS and the phones' connectivity checks
         self.host = host  # the interface to answer on: only the badge's own hotspot, or only your Wi-Fi
         self.pin = pin
@@ -247,6 +261,8 @@ class WebServer:
             except OSError:
                 continue  # the timeout, so the loop can notice it should stop
             reply = dns_reply(data, ip)
+            if LOG and reply:
+                print("Web: dns", dns_name(data))
             if reply:
                 try:
                     s.sendto(reply, addr)
@@ -364,10 +380,12 @@ class WebServer:
         if self.captive:
             host = headers.get("host", "").split(":")[0]
             probe = _PROBES.get(path)
-            if probe and method == "GET":  # a phone checking for internet: say yes, and don't count it as use
-                status, ctype, data = probe
+            if probe and method == "GET":  # a phone checking for internet; not counted as use
                 if LOG:
-                    print("Web: connectivity check", path)
+                    print("Web: connectivity check", path, "-> portal" if self.portal else "-> online")
+                if self.portal:
+                    return await self._redirect(c, "http://%s/" % self.host)
+                status, ctype, data = probe
                 return await self._send(c, self._head(status, ctype, len(data)) + data)
             if host and host != self.host:  # any other name that reached us through our DNS
                 if method == "GET":
