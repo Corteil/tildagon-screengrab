@@ -115,6 +115,9 @@ class ScreenGrab(app.App):
     def _target(self):
         for d in EXTERNAL_DIRS:
             if _exists(d):
+                d += "/screenshots"
+                if not _exists(d):
+                    os.mkdir(d)
                 return d, True
         if not _exists(INTERNAL_DIR):
             os.mkdir(INTERNAL_DIR)

@@ -9,7 +9,7 @@ any app.
    notification confirms it.
 
 Screenshots are 240x240 16-bit BMPs. They go to `/sd` or `/sdcard` if one is
-mounted (no limit), otherwise to `/screenshots` in badge flash, where the
+mounted (in a `screenshots` folder, no limit), otherwise to `/screenshots` in badge flash, where the
 newest 6 are kept.
 
 The frame comes from `display.get_framebuffer()`. Button events normally only
