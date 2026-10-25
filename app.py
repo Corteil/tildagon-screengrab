@@ -213,6 +213,11 @@ class ScreenGrab(app.App):
 
     def __init__(self):
         super().__init__()
+        # Custom firmware builds may lack the framebuffer grab; do nothing then.
+        self._unsupported = not hasattr(display, "get_framebuffer")
+        if self._unsupported:
+            self._warned = False
+            return
         self.button_states = Buttons(self)
         self._sink = _Focused()
         self._held = set()
@@ -689,6 +694,8 @@ class ScreenGrab(app.App):
         eventbus.emit(ShowNotificationEvent(message=msg + (" (%s)" % why if why else "")))
 
     def background_update(self, delta):
+        if self._unsupported:
+            return
         self._timers()
         fb, self._pending = self._pending, None
         if fb is None:
@@ -1269,6 +1276,11 @@ class ScreenGrab(app.App):
         )
 
     def update(self, delta):
+        if self._unsupported:
+            if not self._warned:
+                self._warned = True
+                eventbus.emit(ShowNotificationEvent(message="Screengrab: no display.get_framebuffer"))
+            return
         if self._tdlg is not None:
             self._update(delta)
             return  # redraw every frame while the dialog is open
@@ -1559,6 +1571,17 @@ class ScreenGrab(app.App):
         _chevron(ctx, -96, -1)  # settings
 
     def draw(self, ctx):
+        if self._unsupported:
+            ctx.rgb(0.05, 0.06, 0.10).rectangle(-120, -120, 240, 240).fill()
+            ctx.text_align = ctx.CENTER
+            ctx.text_baseline = ctx.MIDDLE
+            ctx.font_size = 16
+            ctx.rgb(1.0, 0.55, 0.0).move_to(0, -30).text("WARNING")
+            ctx.font_size = 13
+            ctx.rgb(0.8, 0.85, 1.0).move_to(0, -6).text("Screengrab can't run:")
+            ctx.move_to(0, 12).text("this firmware has no")
+            ctx.move_to(0, 30).text("display.get_framebuffer")
+            return
         # The visible area is a circle a bit smaller than the 240px panel, so
         # keep text near the top and bottom short and well inside it.
         ctx.rgb(0.05, 0.06, 0.10).rectangle(-120, -120, 240, 240).fill()

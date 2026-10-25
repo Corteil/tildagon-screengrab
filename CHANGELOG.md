@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.1
+
+- Check for `display.get_framebuffer()` at start-up. On firmware without it
+  the app shows a warning on the display and as a notification, and stays
+  inactive instead of failing.
+
 ## 1.0.0
 
 - Hold LEFT+RIGHT in any app to save the screen as a compressed PNG (own

@@ -3,6 +3,11 @@
 Tildagon badge app that saves a screenshot when you hold **LEFT + RIGHT** in
 any app.
 
+> **Firmware requirement:** Screengrab needs `display.get_framebuffer()`.
+> Some firmware builds, including custom ones, don't have it. There the app
+> can't take screenshots: it shows a WARNING screen and a notification instead
+> of its menu, and does nothing else.
+
 1. Launch **Screengrab** from the Apps menu, then press CANCEL to send it to
    the background.
 2. In any app, hold LEFT and RIGHT together. A "Saved to SD: shot_000N_….png"
