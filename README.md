@@ -39,7 +39,7 @@ Wi-Fi every 5 minutes; until then a random UUID (the part of a
 in badge flash, where the newest 6 are kept. A card is any top-level mount of
 at least 256 KiB, read from the mount table, so it doesn't matter which port
 the hexpansion is in or what its app calls the mount (`/sdcard`, `/sdcard_1`,
-...). The tiny hexpansion EEPROM mounts are skipped. Shots go in a
+...). The tiny hexpansion EEPROM mounts are skipped. Shots are saved in a
 `screenshots` folder on the card, with no limit.
 
 Open the app for its main screen (UP/DOWN to choose, CONFIRM to run). The
@@ -53,8 +53,7 @@ other screens are tiles in a row, with a chevron on the edge showing the way:
 - LEFT and RIGHT together are the screenshot combo, so on every tile a button
   only acts when it is released, and not if the other one was held too.
 
-The main screen shows a viewfinder icon, coloured like the HDMI Manager's
-status icon: **green** with a filled dot when new shots go to a card, **amber**
+The main screen shows a viewfinder icon, **green** with a filled dot when new shots go to a card, **amber**
 with a ring when they go to flash, and **red** with a slash after a failed
 save, or a solid red dot while a time-lapse is running. Under it are the
 target, the shot counts and two items:
