@@ -4,9 +4,27 @@ Tildagon badge app that saves a screenshot when you hold **LEFT + RIGHT** in
 any app.
 
 > **Firmware requirement:** Screengrab needs `display.get_framebuffer()`.
-> Some firmware builds, including custom ones, don't have it. There the app
-> can't take screenshots: it shows a WARNING screen and a notification instead
-> of its menu, and does nothing else.
+> The official firmware doesn't have it yet: it comes from the display-mirror
+> pull request
+> [emfcamp/badge-2024-software#454](https://github.com/emfcamp/badge-2024-software/pull/454)
+> (still open), so builds without that PR can't take screenshots. There the
+> app shows a WARNING screen and a notification instead of its menu, and does
+> nothing else.
+>
+> To get it, build and flash the firmware with the PR added. The branch
+> `pr-454-hazan-mirror` of
+> [Corteil/badge-2024-software](https://github.com/Corteil/badge-2024-software)
+> has it, and the build and flash steps (Docker, `ghcr.io/emfcamp/esp_idf`)
+> are in the
+> [HDMI hexpansion's README](https://github.com/Corteil/rp2350-hdmi-hexpansion#badge-side-driver).
+> In short:
+>
+> ```sh
+> git clone --recursive --branch pr-454-hazan-mirror https://github.com/Corteil/badge-2024-software.git
+> cd badge-2024-software && ./scripts/firstTime.sh
+> docker run --rm --env "TARGET=esp32s3" -v "$(pwd)":/firmware -u "$(id -u):$(id -g)" \
+>   -e HOME=/tmp ghcr.io/emfcamp/esp_idf:v5.5.1
+> ```
 
 1. Launch **Screengrab** from the Apps menu, then press CANCEL to send it to
    the background.
